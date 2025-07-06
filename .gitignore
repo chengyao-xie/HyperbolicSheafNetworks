@@ -1,4 +1,4 @@
 .log
 .pyc
-__pycahce__
+__pycache__
 neural-sheaf/wandb/
