@@ -78,16 +78,19 @@ class HyperbolicLaplacianODEFunc(nn.Module):
             Tensor: Velocity dx/dt, shape (graph_size * d, 1).
         """
         # Reshape x to (graph_size, d)
+        #print(f"forward start: x.shape = {x.shape}")
         x = x.view(self.graph_size, self.d)
+        #print(f"reshaped x: {x.shape}")
 
         # Extract source and target embeddings based on edge_index
         source, target = self.edge_index
         z_source = x[source]  # Shape: (num_edges, d)
         z_target = x[target]  # Shape: (num_edges, d)
-
+        #print(f"source.shape = {source.shape}, target.shape = {target.shape}")
+        #print(f"z_source.shape = {z_source.shape}, z_target.shape = {z_target.shape}")
         # Compute logarithmic maps: log_z_i(z_j) for each edge (i, j)
         logmaps = self.manifold.logmap(z_source, z_target, c=self.c)  # Shape: (num_edges, d)
-
+        #print(f"logmaps.shape = {logmaps.shape}")
         # Compute diffusivity a(z_i, z_j)
         if self.diffusivity_learner is not None:
             # Use learned diffusivity if provided
@@ -97,23 +100,26 @@ class HyperbolicLaplacianODEFunc(nn.Module):
             # sqdist = self.manifold.sqdist(z_source, z_target, c=self.c)  # Shape: (num_edges,)
             # a = torch.exp(-self.beta * sqdist)  # Shape: (num_edges,)
             a = self.norm_weights
-
+        a = a.squeeze(-1)  # shape = (558,)
+        #print(f"a.shape = {a.shape}")
+        #print(f"a.unsqueeze(-1).shape = {a.unsqueeze(-1).shape}")
         # Weight logarithmic maps by diffusivity
         weighted_logmaps = a.unsqueeze(-1) * logmaps  # Shape: (num_edges, d)
-
+        #print(f"weighted_logmaps.shape = {weighted_logmaps.shape}")
         # Aggregate over neighbors for each node i (sum over j where i is source)
         v = scatter_add(weighted_logmaps, source, dim=0, dim_size=self.graph_size)  # Shape: (graph_size, d)
-
+        #print(v.shape)
         # Apply activation function
-        v = self.sigma(v)  # Shape: (graph_size, d), or directly use v if no activation is needed
+        #v = self.sigma(v)  # Shape: (graph_size, d), or directly use v if no activation is needed
 
         # exp_x^c(v)
-        v = self.manifold.expmap(v, x, c=self.c)  # Project back to manifold
-
+        #v = self.manifold.expmap(v, x, c=self.c)  # Project back to manifold
+        v=v.view(-1, 1)
+        #print(f"forward output shape (velocity): {v.shape}")
         # Reshape velocity to match ODE solver input
-        return v.view(-1, 1)  # Shape: (graph_size * d, 1)
+        return v # Shape: (graph_size * d, 1)
 
-class LaplacianODEFunc_(ODEFunc): # this implementation is from grand: neural graph diffusion
+'''class LaplacianODEFunc_(ODEFunc): # this implementation is from grand: neural graph diffusion
 
   # currently requires in_features = out_features
   def __init__(self, in_features, out_features, opt, data, device):
@@ -150,7 +156,7 @@ class LaplacianODEFunc_(ODEFunc): # this implementation is from grand: neural gr
     if self.opt['add_source']: #'If try get rid of alpha param and the beta*x0 source term')
       f = f + self.beta_train * self.x0
     return f
-
+'''
 class LaplacianODEFunc(nn.Module):
     """Implements Laplacian-based diffusion."""
 
@@ -245,6 +251,7 @@ class ODEBlock(nn.Module):
 
     def forward(self, x):
         if self.opt["adjoint"] and self.training:
+            print('111111111111111')
             z = odeint_adjoint(
                 self.odefunc, x, self.t,
                 method=self.opt['int_method'], # set the numerical solver: hyperbolic_rk4, rk4, dopri5
@@ -256,6 +263,7 @@ class ODEBlock(nn.Module):
                 adjoint_atol=self.atol_adjoint,
                 adjoint_rtol=self.rtol_adjoint)
         else:
+            #print('222222222222')
             z = odeint(
                 self.odefunc, x, self.t,
                 method=self.opt['int_method'],
@@ -275,7 +283,7 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
         # Hyperbolic dimension
         self.d = args.get('hyperbolic_dim', 2)  # Default to 2D hyperbolic space, adjust as needed
         self.hidden_dim = self.d  # Align hidden dimension with hyperbolic dimension
-
+        #print("input_dim:", self.input_dim)
         # Input projection to hyperbolic space
         self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
         if self.second_linear:
@@ -284,7 +292,7 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
 
         # Optional: Learn diffusivity similar to sheaf_learner
         self.diffusivity_learner = LocalConcatSheafLearner(
-            self.hidden_dim, out_shape=(1,), sheaf_act=self.sheaf_act) if args.get('learn_diffusivity', False) else None
+            self.hidden_dim, out_shape=(1,), sheaf_act=self.sheaf_act) #if args.get('learn_diffusivity', False) else None
 
         # Define hyperbolic ODE function
         self.odefunc = HyperbolicLaplacianODEFunc(
@@ -298,27 +306,44 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
         )
         self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
         self.manifold = PoincareBall()
+        self.sheaf_learners = [self.diffusivity_learner] if self.diffusivity_learner is not None else []
+        if self.diffusivity_learner is not None:
+            # 假设 learner 中定义了可学习参数 epsilons
+            self.epsilons = list(self.diffusivity_learner.parameters())
+        else:
+            self.epsilons = []
 
     def forward(self, x):
+        print("[DEBUG] lin1.weight nan?", torch.isnan(self.lin1.weight).any().item())
+        print("[DEBUG] lin1.bias nan?", torch.isnan(self.lin1.bias).any().item())
+        print("[DEBUG] lin1.weight max abs:", self.lin1.weight.abs().max().item())
         x = F.dropout(x, p=self.input_dropout, training=self.training)
+        print("[DEBUG] input x before lin1: nan?", torch.isnan(x).any().item())
         x = self.lin1(x)  # (graph_size, hidden_dim)
+        print("[DEBUG] After lin1: nan?", torch.isnan(x).any().item())
         if self.use_act:
             x = F.elu(x)
+        print("[DEBUG] After ELU: nan?", torch.isnan(x).any().item())
         x = F.dropout(x, p=self.dropout, training=self.training)
         if self.second_linear:
             x = self.lin12(x)
-
+        print("[DEBUG] After lin12: nan?", torch.isnan(x).any().item())
         # Project to Poincaré disk
-        x = self.manifold.expmap0(x)  # Ensure x is in hyperbolic space
-
+        x = self.manifold.expmap0(x,1.0)  # Ensure x is in hyperbolic space
+        print("[DEBUG] After expmap0: nan?", torch.isnan(x).any().item())
         if self.t > 0:
             x = x.view(self.graph_size * self.d, -1)  # (graph_size * d, 1)
+            print("[DEBUG] Before odeblock: nan?", torch.isnan(x).any().item())
             x = self.odeblock(x)  # Apply hyperbolic diffusion
-
-        x = self.manifold.logmap0(x)  # Project back to Poincaré disk
+            print("[DEBUG] After odeblock: nan?", torch.isnan(x).any().item())
+        x = self.manifold.logmap0(x,1.0)  # Project back to Poincaré disk
+        print("[DEBUG] After logmap0: nan?", torch.isnan(x).any().item())
         x = x.view(self.graph_size, -1)  # (graph_size, d)
         x = self.lin2(x)  # Map to output dimension
-        return F.log_softmax(x, dim=1)
+        print("[DEBUG] After lin2: nan?", torch.isnan(x).any().item())
+        out = F.log_softmax(x, dim=1)
+        print("[DEBUG] After log_softmax: nan?", torch.isnan(out).any().item())
+        return out
 
     def update_edge_index(self, edge_index):
         super().update_edge_index(edge_index)

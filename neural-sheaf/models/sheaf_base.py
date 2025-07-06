@@ -53,7 +53,7 @@ class SheafDiffusion(nn.Module):
         self.edge_index = edge_index
         self.laplacian_builder = self.laplacian_builder.create_with_new_edge_index(edge_index)
 
-    def grouped_parameters(self):
+    '''def grouped_parameters(self):
         sheaf_learners, others = [], []
         for name, param in self.named_parameters():
             if "sheaf_learner" in name:
@@ -62,4 +62,17 @@ class SheafDiffusion(nn.Module):
                 others.append(param)
         assert len(sheaf_learners) > 0
         assert len(sheaf_learners) + len(others) == len(list(self.parameters()))
+        return sheaf_learners, others'''
+
+    def grouped_parameters(self):
+        sheaf_learners, others = [], []
+        for name, param in self.named_parameters():
+            if any(k in name for k in ["sheaf_learner", "diffusivity_learner", "edge_weight_learner"]):
+                sheaf_learners.append(param)
+            else:
+                others.append(param)
+        if len(sheaf_learners) == 0:
+            print("[Warning] No sheaf learner parameters detected.")
+        assert len(sheaf_learners) + len(others) == len(list(self.parameters()))
         return sheaf_learners, others
+

@@ -1,0 +1,40 @@
+{
+    "os": "Windows-10-10.0.22631-SP0",
+    "python": "3.9.9",
+    "heartbeatAt": "2025-07-05T08:05:08.633569",
+    "startedAt": "2025-07-05T08:05:07.903396",
+    "docker": null,
+    "gpu": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+    "gpu_count": 1,
+    "cpu_count": 20,
+    "cuda": null,
+    "args": [
+        "--dataset=texas",
+        "--d=3",
+        "--layers=4",
+        "--hidden_channels=20",
+        "--left_weights=True",
+        "--right_weights=True",
+        "--lr=0.02",
+        "--weight_decay=5e-3",
+        "--input_dropout=0.0",
+        "--dropout=0.7",
+        "--use_act=True",
+        "--model=HyperbolicSheaf",
+        "--normalised=True",
+        "--sparse_learner=True",
+        "--int_method=hyperbolic_rk4",
+        "--entity="
+    ],
+    "state": "running",
+    "program": "-m exp.run",
+    "git": {
+        "remote": "https://github.com/chengyao-xie/HyperbolicSheafNetworks.git",
+        "commit": "f8e29ae84cd1f6c6ce9e4f3123288773b8de5251"
+    },
+    "email": "1831279645@qq.com",
+    "root": "D:/sheafdiffusion/HyperbolicSheafNetworks",
+    "host": "LAPTOP-T328AL3S",
+    "username": "LENOVO",
+    "executable": "D:\\python_excel\\anaconda\\envs\\nsd\\python.exe"
+}

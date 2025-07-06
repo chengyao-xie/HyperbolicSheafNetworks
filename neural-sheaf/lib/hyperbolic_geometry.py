@@ -404,6 +404,9 @@ class PoincareBall(Manifold):
         return u
 
     def expmap(self, u, p, c):
+        #print(f"expmap input shapes: p={p.shape}, u={u.shape}")
+        if p.dim() == 2 and u.dim() == 3:
+            p = p.unsqueeze(1)
         sqrt_c = c ** 0.5
         u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
         second_term = (
@@ -415,6 +418,7 @@ class PoincareBall(Manifold):
         return gamma_1
 
     def logmap(self, p1, p2, c):
+        assert p1.shape == p2.shape, f"logmap shape mismatch: p1={p1.shape}, p2={p2.shape}"
         ##BATCH
         sub = self.mobius_add(-p1, p2, c)
         sub_norm = sub.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
@@ -440,6 +444,7 @@ class PoincareBall(Manifold):
         ### BATCH
         x2 = x.pow(2).sum(dim=dim, keepdim=True)
         y2 = y.pow(2).sum(dim=dim, keepdim=True)
+        #print(f"mobius_add input shapes: x={x.shape}, y={y.shape}")
         xy = (x * y).sum(dim=dim, keepdim=True)
         num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
         denom = 1 + 2 * c * xy + c ** 2 * x2 * y2

@@ -369,7 +369,7 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
 
     return shapes, func, y0, t, rtol, atol, method, options, event_fn, t_is_reversed
 
-def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False):
+def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0):
     """
     Implements one step of the hyperbolic 3/8 4th-order Runge-Kutta method.
     
@@ -386,33 +386,33 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False):
         y1: Next state (point on the manifold, tensor).
     """
     # Ensure dt is a scalar tensor with appropriate dtype
+
     dt = dt.to(y0.dtype)
-    
     # k1: Hyperbolic Euler step to get a point on the manifold
     k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)  # manifold (h_HEuler(t + τ)) vector at y0
-
+    #print(f"[RK4 STEP] y0.shape = {y0.shape}, k1.shape = {k1.shape}")
     
     # Compute tangent vector for k1 at y0 for the final update
-    k1_tangent = manifold.logmap(y0, k1)  # Tangent vector at y0
+    k1_tangent = manifold.logmap(y0, k1,c)  # Tangent vector at y0
     
     # k2: Compute intermediate point and evaluate func
     X_k2 = k1_tangent / 3  # Tangent vector at y0: log_y0(k1) / 3
-    h2 = manifold.expmap(y0, dt * X_k2)  # Point on manifold: exp_y0(τ * X_k2)
+    h2 = manifold.expmap(y0, dt * X_k2,c)  # Point on manifold: exp_y0(τ * X_k2)
     k2 = func(t0 + dt / 3, h2)  # Tangent vector at h2
-    k2_tangent = manifold.logmap(y0, k2)  # Point derived from k2
+    k2_tangent = manifold.logmap(y0, k2,c)  # Point derived from k2
 
     # k3: Compute intermediate point and evaluate func
     # To avoid logmap on k2 (tangent vector), compute a point h2_tangent from k2
     X_k3 = k2_tangent - k1_tangent / 3  # Tangent vector at y0
-    h3 = manifold.expmap(y0, dt * X_k3)  # Point on manifold
+    h3 = manifold.expmap(y0, dt * X_k3,c)  # Point on manifold
     k3 = func(t0 + 2 * dt / 3, h3)  # Tangent vector at h3
-    k3_tangent = manifold.logmap(y0, k3)  # Point derived from k2
+    k3_tangent = manifold.logmap(y0, k3,c)  # Point derived from k2
     
     # k4: Compute intermediate point and evaluate func
     X_k4 = k1_tangent - k2_tangent + k3_tangent  # Tangent vector at y0
-    h4 = manifold.expmap(y0, dt * X_k4)  # Point on manifold
+    h4 = manifold.expmap(y0, dt * X_k4,c)  # Point on manifold
     k4 = func(t1, h4, perturb=Perturb.PREV if perturb else Perturb.NONE)  # Tangent vector at h4
-    k4_tangent = manifold.logmap(y0, k4)  # Point derived from k2
+    k4_tangent = manifold.logmap(y0, k4,c)  # Point derived from k2
     
     # Combine tangent vectors with 3/8 weights
     # Note: k2, k3, k4 are in different tangent spaces (T_h2 M, T_h3 M, T_h4 M)
@@ -420,7 +420,7 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False):
     update_v = (k1_tangent + 3 * k2_tangent + 3 * k3_tangent + k4_tangent) * (dt / 8)
     
     # Update state using exponential map
-    y1 = manifold.expmap(y0, update_v)
+    y1 = manifold.expmap(y0, update_v,c)
     
     return y1
 
@@ -593,6 +593,7 @@ class HyperbolicRK4(FixedGridODESolver):
         """
         super().__init__(func, y0, step_size=step_size, grid_constructor=grid_constructor, interp=interp, perturb=perturb, **unused_kwargs)
         self.manifold = manifold
+        #self.curvature = options.get("c", 1.0)
         if manifold is None:
             raise ValueError("Manifold object must be provided for hyperbolic integration.")
     
@@ -610,10 +611,10 @@ class HyperbolicRK4(FixedGridODESolver):
         Returns:
             dy: Increment (tangent vector), f0: Initial derivative (tangent vector).
         """
-        y1 = hyperbolic_rk4_step_func(func, t0, dt, t1, y0, self.manifold, perturb=self.perturb)
+        y1 = hyperbolic_rk4_step_func(func, t0, dt, t1, y0, self.manifold, perturb=self.perturb, c=1.0)
         f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
         # Compute dy as the tangent vector from y0 to y1 for compatibility
-        dy = self.manifold.logmap(y0, y1)
+        dy = self.manifold.logmap(y0, y1,1.0)
         return dy, f0
 
 
