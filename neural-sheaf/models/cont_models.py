@@ -113,7 +113,7 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         #v = self.sigma(v)  # Shape: (graph_size, d), or directly use v if no activation is needed
 
         # exp_x^c(v)
-        #v = self.manifold.expmap(v, x, c=self.c)  # Project back to manifold
+        v = self.manifold.expmap(v, x, c=self.c)  # Project back to manifold
         v=v.view(-1, 1)
         #print(f"forward output shape (velocity): {v.shape}")
         # Reshape velocity to match ODE solver input
@@ -282,6 +282,7 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
         super(HyperbolicGraphDiffusion, self).__init__(edge_index, args)
         # Hyperbolic dimension
         self.d = args.get('hyperbolic_dim', 2)  # Default to 2D hyperbolic space, adjust as needed
+        self.c = 1.0 # hyperbolic curvature
         self.hidden_dim = self.d  # Align hidden dimension with hyperbolic dimension
         #print("input_dim:", self.input_dim)
         # Input projection to hyperbolic space
@@ -329,7 +330,8 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
             x = self.lin12(x)
         print("[DEBUG] After lin12: nan?", torch.isnan(x).any().item())
         # Project to Poincaré disk
-        x = self.manifold.expmap0(x,1.0)  # Ensure x is in hyperbolic space
+        # x = self.manifold.expmap0(x,1.0)  # Ensure x is in hyperbolic space
+        x = self.manifold.proj(self.manifold.expmap0(self.manifold.proj_tan0(x, self.c), c=self.c), c=self.c)
         print("[DEBUG] After expmap0: nan?", torch.isnan(x).any().item())
         if self.t > 0:
             x = x.view(self.graph_size * self.d, -1)  # (graph_size * d, 1)
