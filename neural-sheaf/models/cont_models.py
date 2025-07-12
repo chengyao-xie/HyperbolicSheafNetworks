@@ -26,57 +26,68 @@ class HyperbolicLaplacianODEFunc(nn.Module):
     #              use_act=False,
     #              nonlinear=False,
     #              weight_learner=None):
-    def __init__(self, edge_index, graph_size, d, beta=1.0, sigma=nn.ReLU(), c=1.0, diffusivity_learner=None):
-        """
-        Initialize the hyperbolic Laplacian ODE function.
+    def __init__(self, 
+                d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels, 
+                left_weights=False,
+                right_weights=False,
+                use_act=False,
+                nonlinear=False,
+                weight_learner=None):
 
-        Args:
-            edge_index (Tensor): Edge indices, shape (2, num_edges).
-            graph_size (int): Number of nodes in the graph.
-            d (int): Dimension of the hyperbolic space.
-            beta (float): Parameter for distance-based diffusivity (default: 1.0).
-            sigma (nn.Module): Activation function (default: nn.ReLU()).
-            c (float): Curvature of the Poincaré ball (default: 1.0).
-            diffusivity_learner (nn.Module, optional): Learned diffusivity module (default: None).
-        """
         super(HyperbolicLaplacianODEFunc, self).__init__()
+        self.d = d
+        self.hidden_channels = hidden_channels
+        self.weight_learner = weight_learner
+        self.sheaf_learner = sheaf_learner  # Optional learned diffusivity
+        self.laplacian_builder = laplacian_builder
         self.edge_index = edge_index
+        self.nonlinear = nonlinear
         self.graph_size = graph_size
-        self.d = d  # Dimension of hyperbolic space
-        self.beta = beta  # Parameter for distance-based diffusivity
-        self.sigma = sigma  # Activation function
-        self.c = c  # Curvature of Poincaré ball
-        self.diffusivity_learner = diffusivity_learner  # Optional learned diffusivity
-        self.manifold = PoincareBall()  # Trustworthy Poincaré ball implementation
-        if self.diffusivity_learner is None:
-            self.norm_weights = self.compute_normalized_weights()
-        else:
-            self.norm_weights = None
-
-    def compute_normalized_weights(self):
+        self.left_weights = left_weights
+        self.right_weights = right_weights
+        self.use_act = use_act
         
-        deg = scatter_add(torch.ones_like(self.edge_index[0], dtype=torch.float), 
-                        self.edge_index[0], dim=0, dim_size=self.graph_size)
-        deg = deg.clamp(min=1e-6)
-        source, target = self.edge_index
-        deg_source = deg[source]
-        deg_target = deg[target]
-        norm_weights = 1 / (torch.sqrt(deg_source) * torch.sqrt(deg_target))
-        return norm_weights
+        self.L = None
+        
+        if self.left_weights:
+            self.lin_left_weights = nn.Linear(self.d, self.d, bias=False)
+        if self.right_weights:
+            self.lin_right_weights = nn.Linear(self.hidden_channels, self.hidden_channels, bias=False)
 
+        # self.beta = 1.0  # Parameter for distance-based diffusivity
+        # self.sigma = nn.ReLU()  # Activation function
+        self.c = 1.0  # Curvature of Poincaré ball
+        self.manifold = PoincareBall()  # Trustworthy Poincaré ball implementation
+
+    def update_laplacian_builder(self, laplacian_builder):
+        self.edge_index = laplacian_builder.edge_index
+        self.laplacian_builder = laplacian_builder
+        
     def forward(self, t, x):
-        """
-        Compute the velocity (dx/dt) for the ODE solver.
-        different from the paper, this func takes input and outputs the value in the tangent space.
-        so in the solver, the value need to be projected back to the manifold (Poincaré ball).
+        if self.nonlinear or self.L is None:
+            # Update the laplacian at each step.
+            x_maps = x.view(self.graph_size, -1)
+            maps = self.sheaf_learner(x_maps, self.edge_index)
+            if self.weight_learner is not None:
+                edge_weights = self.weight_learner(x_maps, self.edge_index)
+                L, _ = self.laplacian_builder(maps, edge_weights)
+            else:
+                L, _ = self.laplacian_builder(maps)
+            self.L = L
+        else:
+            # Cache the Laplacian obtained at the first layer for the rest of the integration.
+            L = self.L
 
-        Args:
-            t (float): Time point (scalar).
-            x (Tensor): Node embeddings, shape (graph_size * d, 1).
+        if self.left_weights:
+            x = x.t().reshape(-1, self.d)
+            x = self.lin_left_weights(x)
+            x = x.reshape(-1, self.graph_size * self.d).t()
 
-        Returns:
-            Tensor: Velocity dx/dt, shape (graph_size * d, 1).
-        """
+        if self.right_weights:
+            x = self.lin_right_weights(x)
+
+            
+            
         # Reshape x to (graph_size, d)
         #print(f"forward start: x.shape = {x.shape}")
         x = x.view(self.graph_size, self.d)
@@ -91,32 +102,37 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         # Compute logarithmic maps: log_z_i(z_j) for each edge (i, j)
         logmaps = self.manifold.logmap(z_source, z_target, c=self.c)  # Shape: (num_edges, d)
         #print(f"logmaps.shape = {logmaps.shape}")
-        # Compute diffusivity a(z_i, z_j)
-        if self.diffusivity_learner is not None:
-            # Use learned diffusivity if provided
-            a = self.diffusivity_learner(x, self.edge_index)  # Shape: (num_edges,)
-        else:
-            # # Default: Dirichlet Energy
-            # sqdist = self.manifold.sqdist(z_source, z_target, c=self.c)  # Shape: (num_edges,)
-            # a = torch.exp(-self.beta * sqdist)  # Shape: (num_edges,)
-            a = self.norm_weights
-        a = a.squeeze(-1)  # shape = (558,)
-        #print(f"a.shape = {a.shape}")
-        #print(f"a.unsqueeze(-1).shape = {a.unsqueeze(-1).shape}")
-        # Weight logarithmic maps by diffusivity
-        weighted_logmaps = a.unsqueeze(-1) * logmaps  # Shape: (num_edges, d)
-        #print(f"weighted_logmaps.shape = {weighted_logmaps.shape}")
-        # Aggregate over neighbors for each node i (sum over j where i is source)
-        v = scatter_add(weighted_logmaps, source, dim=0, dim_size=self.graph_size)  # Shape: (graph_size, d)
-        #print(v.shape)
-        # Apply activation function
-        #v = self.sigma(v)  # Shape: (graph_size, d), or directly use v if no activation is needed
+        
+        
+        # # Compute diffusivity a(z_i, z_j)
+        # if self.diffusivity_learner is not None:
+        #     # hyperbolic diffusivity_learner is not implemented, don't use this branch
+        #     a = self.diffusivity_learner(x, self.edge_index)  # Shape: (num_edges,)
+        # else:
+        #     # # Default: Dirichlet Energy
+        #     # sqdist = self.manifold.sqdist(z_source, z_target, c=self.c)  # Shape: (num_edges,)
+        #     # a = torch.exp(-self.beta * sqdist)  # Shape: (num_edges,)
+        #     a = self.norm_weights
+        # a = a.squeeze(-1)  # shape = (558,)
+        # #print(f"a.shape = {a.shape}")
+        # #print(f"a.unsqueeze(-1).shape = {a.unsqueeze(-1).shape}")
+        # # Weight logarithmic maps by diffusivity
+        # weighted_logmaps = a.unsqueeze(-1) * logmaps  # when k=0, the Hodge laplacian equals to graph laplacian
+        # #print(f"weighted_logmaps.shape = {weighted_logmaps.shape}")
+        # # Aggregate over neighbors for each node i (sum over j where i is source)
+        # v = scatter_add(weighted_logmaps, source, dim=0, dim_size=self.graph_size)  # Shape: (graph_size, d)
+        # #print(v.shape)
+        
+
+
+        x = torch_sparse.spmm(L[0], L[1], x.size(0), x.size(0), -x)
 
         # exp_x^c(v)
         v = self.manifold.expmap(v, x, c=self.c)  # Project back to manifold
-        v=v.view(-1, 1)
-        #print(f"forward output shape (velocity): {v.shape}")
-        # Reshape velocity to match ODE solver input
+        # v=v.view(-1, 1)
+        # if self.use_act:
+        #     x = F.elu(x)
+        
         return v # Shape: (graph_size * d, 1)
 
 '''class LaplacianODEFunc_(ODEFunc): # this implementation is from grand: neural graph diffusion
@@ -264,6 +280,7 @@ class ODEBlock(nn.Module):
                 adjoint_rtol=self.rtol_adjoint)
         else:
             #print('222222222222')
+            print('odeint training')
             z = odeint(
                 self.odefunc, x, self.t,
                 method=self.opt['int_method'],
@@ -281,38 +298,48 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
     def __init__(self, edge_index, args):
         super(HyperbolicGraphDiffusion, self).__init__(edge_index, args)
         # Hyperbolic dimension
-        self.d = args.get('hyperbolic_dim', 2)  # Default to 2D hyperbolic space, adjust as needed
+        # self.d = args.get('hyperbolic_dim', 2)  # defined in the SheafDiffusion class
         self.c = 1.0 # hyperbolic curvature
-        self.hidden_dim = self.d  # Align hidden dimension with hyperbolic dimension
-        #print("input_dim:", self.input_dim)
+        print("input_dim:", self.input_dim)
+        
+        
+    
         # Input projection to hyperbolic space
         self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
         if self.second_linear:
             self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
 
-        # Optional: Learn diffusivity similar to sheaf_learner
-        self.diffusivity_learner = LocalConcatSheafLearner(
-            self.hidden_dim, out_shape=(1,), sheaf_act=self.sheaf_act) #if args.get('learn_diffusivity', False) else None
+        # # Optional: Learn diffusivity similar to sheaf_learner
+        # self.diffusivity_learner = LocalConcatSheafLearner(
+        #     self.hidden_dim, out_shape=(1,), sheaf_act=self.sheaf_act) #if args.get('learn_diffusivity', False) else None
+        
+        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, edge_index)
+        self.laplacian_builder = lb.DiagLaplacianBuilder(
+            self.graph_size, edge_index, d=self.d, add_hp=self.add_hp, add_lp=self.add_lp)
 
         # Define hyperbolic ODE function
         self.odefunc = HyperbolicLaplacianODEFunc(
-            edge_index=edge_index,
-            graph_size=self.graph_size,
-            d=self.d,
-            beta=args.get('beta', 1.0),
-            sigma=nn.ReLU(),
-            c=args.get('curvature', 1.0),
-            diffusivity_learner=self.diffusivity_learner
-        )
+            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
+            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
+            use_act=self.use_act)
+            # edge_index=edge_index,
+            # graph_size=self.graph_size,
+            # d=self.d,
+            # beta=args.get('beta', 1.0),
+            # sigma=nn.ReLU(),
+            # c=args.get('curvature', 1.0),
+            # diffusivity_learner = None
+        
+        
         self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
         self.manifold = PoincareBall()
-        self.sheaf_learners = [self.diffusivity_learner] if self.diffusivity_learner is not None else []
-        if self.diffusivity_learner is not None:
-            # 假设 learner 中定义了可学习参数 epsilons
-            self.epsilons = list(self.diffusivity_learner.parameters())
-        else:
-            self.epsilons = []
+        # self.sheaf_learners = [self.diffusivity_learner] if self.diffusivity_learner is not None else []
+        # if self.diffusivity_learner is not None:
+        #     # 假设 learner 中定义了可学习参数 epsilons
+        #     self.epsilons = list(self.diffusivity_learner.parameters())
+        # else:
+        #     self.epsilons = []
 
     def forward(self, x):
         print("[DEBUG] lin1.weight nan?", torch.isnan(self.lin1.weight).any().item())
@@ -330,8 +357,9 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
             x = self.lin12(x)
         print("[DEBUG] After lin12: nan?", torch.isnan(x).any().item())
         # Project to Poincaré disk
-        # x = self.manifold.expmap0(x,1.0)  # Ensure x is in hyperbolic space
+        # x = self.manifold.expmap0(x, self.c)  # Ensure x is in hyperbolic space
         x = self.manifold.proj(self.manifold.expmap0(self.manifold.proj_tan0(x, self.c), c=self.c), c=self.c)
+
         print("[DEBUG] After expmap0: nan?", torch.isnan(x).any().item())
         if self.t > 0:
             x = x.view(self.graph_size * self.d, -1)  # (graph_size * d, 1)
