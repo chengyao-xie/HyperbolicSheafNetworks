@@ -5,6 +5,7 @@ from distutils.util import strtobool
 import argparse
 
 
+
 def str2bool(x):
     if type(x) == bool:
         return x
