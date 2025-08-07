@@ -81,16 +81,14 @@ class GNNEarly(BaseGNN):
       c_aux = torch.zeros(x.shape).to(self.device)
       x = torch.cat([x, c_aux], dim=1)
 
-    # 尽量不去改x的值，可以在生成数据的时候用normalize来归一化
+    self.odeblock.set_x0(x)
+
+    
     x = torch.clamp(x, min=-5.0, max=5.0)
     x = self.manifold.proj_tan0(x, self.c)
     x = 0.5 * x
     x = self.manifold.expmap0(x, c=self.c)
     x = self.manifold.proj(x, c=self.c)
-
-    self.odeblock.set_x0(x)
-
-
 
     with torch.no_grad():
       self.set_solver_m2()
