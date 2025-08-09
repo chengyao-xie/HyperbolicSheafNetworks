@@ -12,6 +12,7 @@ from torch.autograd.functional import vjp
 _one_third = 1 / 3
 _two_thirds = 2 / 3
 _one_sixth = 1 / 6 
+_one_eighth = 1 / 8
 
 
 class Perturb(Enum):

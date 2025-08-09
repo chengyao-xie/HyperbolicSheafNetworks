@@ -43,18 +43,38 @@ class ConstantODEblock(ODEblock):
     func = self.reg_odefunc if self.training and self.nreg > 0 else self.odefunc
     state = (x,) + reg_states if self.training and self.nreg > 0 else x
 
-    # 使用超曲率 RK4，并传入 manifold
-    state_dt = integrator(
-      func, state, t,
-      method='hyperbolic_rk4',
-      options=dict(
-        step_size=max(1e-2, self.opt['step_size']),
-        max_iters=max(10, int(self.opt['max_iters'])),
-        manifold=self.manifold
-      ),
-      atol=self.atol,
-      rtol=self.rtol
-    )
+    # 启用 adjoint 以支持反向传播
+    if self.opt['adjoint'] and self.training:
+      state_dt = integrator(
+        func, state, t,
+        method='hyperbolic_rk4',
+        options=dict(
+          step_size=max(1e-2, self.opt['step_size']),
+          max_iters=max(10, int(self.opt['max_iters'])),
+          manifold=self.manifold
+        ),
+        adjoint_method=self.opt['adjoint_method'],
+        adjoint_options=dict(
+          step_size=max(1e-2, self.opt['adjoint_step_size']),
+          max_iters=max(10, int(self.opt['max_iters']))
+        ),
+        atol=self.atol,
+        rtol=self.rtol,
+        adjoint_atol=self.atol_adjoint,
+        adjoint_rtol=self.rtol_adjoint
+      )
+    else:
+      state_dt = integrator(
+        func, state, t,
+        method='hyperbolic_rk4',
+        options=dict(
+          step_size=max(1e-2, self.opt['step_size']),
+          max_iters=max(10, int(self.opt['max_iters'])),
+          manifold=self.manifold
+        ),
+        atol=self.atol,
+        rtol=self.rtol
+      )
 
     if self.training and self.nreg > 0:
       z = state_dt[0][1]

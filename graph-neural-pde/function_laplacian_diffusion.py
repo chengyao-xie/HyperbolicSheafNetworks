@@ -57,10 +57,11 @@ class LaplacianODEFunc(ODEFunc):
 
 
 
-class HyperbolicGraphLaplacianODEFunc(nn.Module):
+class HyperbolicGraphLaplacianODEFunc(ODEFunc):
     """Implements hyperbolic diffusion (Eq. 15) on the Poincaré ball."""
     def __init__(self, in_features, out_features, opt, data, device):
-        super(HyperbolicGraphLaplacianODEFunc, self).__init__()
+        super(HyperbolicGraphLaplacianODEFunc, self).__init__(opt, data, device)
+        
         # 从数据对象初始化图结构
         self.edge_index = data.edge_index.to(device)
         self.edge_weight = data.edge_attr
@@ -96,6 +97,8 @@ class HyperbolicGraphLaplacianODEFunc(nn.Module):
         输入与输出均在切空间中进行演化，外部求解器负责在步进间做投影/映射。
         x: (N, d)
         """
+        if self.nfe > self.opt["max_nfe"]:
+            raise MaxNFEException
         self.nfe += 1
 
         # 保证形状 (N, d)

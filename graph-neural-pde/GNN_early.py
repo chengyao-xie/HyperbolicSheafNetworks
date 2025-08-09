@@ -81,12 +81,15 @@ class GNNEarly(BaseGNN):
       c_aux = torch.zeros(x.shape).to(self.device)
       x = torch.cat([x, c_aux], dim=1)
 
-    # 尽量不去改x的值，可以在生成数据的时候用normalize来归一化
-    x = torch.clamp(x, min=-5.0, max=5.0)
-    x = self.manifold.proj_tan0(x, self.c)
-    x = 0.5 * x
-    x = self.manifold.expmap0(x, c=self.c)
-    x = self.manifold.proj(x, c=self.c)
+    # self.odeblock.set_x0(x)
+
+    # Project to hyperbolic space if using hyperbolic geometry
+    if self.opt['function'] == 'hyperbolic_laplacian':
+      # x = torch.clamp(x, min=-5.0, max=5.0)
+      x = self.manifold.proj_tan0(x, self.c)
+      # x = 0.5 * x
+      x = self.manifold.expmap0(x, c=self.c)
+      x = self.manifold.proj(x, c=self.c)
 
     self.odeblock.set_x0(x)
 
@@ -95,16 +98,15 @@ class GNNEarly(BaseGNN):
     with torch.no_grad():
       self.set_solver_m2()
 
-    if self.training  and self.odeblock.nreg > 0:
-      z, self.reg_states  = self.odeblock(x)
+    if self.training and self.odeblock.nreg > 0:
+      z, self.reg_states = self.odeblock(x)
     else:
       z = self.odeblock(x)
 
-    # 将结果拉回切空间，统一保持几何一致性
-    z = self.manifold.proj(z, c=self.c)
-    z = self.manifold.logmap0(z, self.c)
-    z = torch.where(torch.isfinite(z), z, torch.zeros_like(z))
-
+    # Project back to tangent space if using hyperbolic geometry
+    if self.opt['function'] == 'hyperbolic_laplacian':
+      z = self.manifold.proj(z, c=self.c)
+      z = self.manifold.logmap0(z, self.c)
     if self.opt['augment']:
       z = torch.split(z, x.shape[1] // 2, dim=1)[0]
 
@@ -317,15 +319,15 @@ if __name__ == '__main__':
   parser.add_argument('--planetoid_split', action='store_true',
                       help='use planetoid splits for Cora/Citeseer/Pubmed')
   # GNN args
-  parser.add_argument('--hidden_dim', type=int, default=16, help='Hidden dimension.')
+  parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension.')
   parser.add_argument('--fc_out', dest='fc_out', action='store_true',
                       help='Add a fully connected layer to the decoder.')
-  parser.add_argument('--input_dropout', type=float, default=0.5, help='Input dropout rate.')
-  parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate.')
+  parser.add_argument('--input_dropout', type=float, default=0.3, help='Input dropout rate.')
+  parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate.')
   parser.add_argument("--batch_norm", dest='batch_norm', action='store_true', help='search over reg params')
   parser.add_argument('--optimizer', type=str, default='adam', help='One from sgd, rmsprop, adam, adagrad, adamax.')
-  parser.add_argument('--lr', type=float, default=0.01, help='Learning rate.')
-  parser.add_argument('--decay', type=float, default=5e-4, help='Weight decay for optimization')
+  parser.add_argument('--lr', type=float, default=0.005, help='Learning rate.')
+  parser.add_argument('--decay', type=float, default=1e-4, help='Weight decay for optimization')
   parser.add_argument('--epoch', type=int, default=100, help='Number of training epochs per iteration.')
   parser.add_argument('--alpha', type=float, default=1.0, help='Factor in front matrix A.')
   parser.add_argument('--alpha_dim', type=str, default='sc', help='choose either scalar (sc) or vector (vc) alpha')
@@ -341,20 +343,20 @@ if __name__ == '__main__':
   parser.add_argument('--cgnn', dest='cgnn', action='store_true', help='Run the baseline CGNN model from ICML20')
 
   # ODE args
-  parser.add_argument('--time', type=float, default=1.0, help='End time of ODE integrator.')
+  parser.add_argument('--time', type=float, default=2.0, help='End time of ODE integrator.')
   parser.add_argument('--augment', action='store_true',
                       help='double the length of the feature vector by appending zeros to stabilist ODE learning')
   parser.add_argument('--method', type=str, default = 'hyperbolic_rk4', help="set the numerical solver: dopri5, euler, rk4, midpoint")
-  parser.add_argument('--step_size', type=float, default=1,
+  parser.add_argument('--step_size', type=float, default=0.5,
                       help='fixed step size when using fixed step solvers e.g. rk4')
-  parser.add_argument('--max_iters', type=float, default=100, help='maximum number of integration steps')
+  parser.add_argument('--max_iters', type=float, default=200, help='maximum number of integration steps')
   parser.add_argument("--adjoint_method", type=str, default="adaptive_heun",
                       help="set the numerical solver for the backward pass: dopri5, euler, rk4, midpoint")
   parser.add_argument('--adjoint', dest='adjoint', action='store_true',
                       help='use the adjoint ODE method to reduce memory footprint')
   parser.add_argument('--adjoint_step_size', type=float, default=1,
                       help='fixed step size when using fixed step adjoint solvers e.g. rk4')
-  parser.add_argument('--tol_scale', type=float, default=1., help='multiplier for atol and rtol')
+  parser.add_argument('--tol_scale', type=float, default=0.5, help='multiplier for atol and rtol')
   parser.add_argument("--tol_scale_adjoint", type=float, default=1.0,
                       help="multiplier for adjoint_atol and adjoint_rtol")
   parser.add_argument('--ode_blocks', type=int, default=1, help='number of ode blocks to run')
@@ -371,9 +373,9 @@ if __name__ == '__main__':
   parser.add_argument('--leaky_relu_slope', type=float, default=0.2,
                       help='slope of the negative part of the leaky relu used in attention')
   parser.add_argument('--attention_dropout', type=float, default=0., help='dropout of attention weights')
-  parser.add_argument('--heads', type=int, default=4, help='number of attention heads')
+  parser.add_argument('--heads', type=int, default=8, help='number of attention heads')
   parser.add_argument('--attention_norm_idx', type=int, default=0, help='0 = normalise rows, 1 = normalise cols')
-  parser.add_argument('--attention_dim', type=int, default=64,
+  parser.add_argument('--attention_dim', type=int, default=128,
                       help='the size to project x to before calculating att scores')
   parser.add_argument('--mix_features', dest='mix_features', action='store_true',
                       help='apply a feature transformation xW to the ODE')
