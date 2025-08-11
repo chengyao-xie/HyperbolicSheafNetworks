@@ -125,8 +125,9 @@ class HyperbolicGraphLaplacianODEFunc(ODEFunc):
         v = scatter_add(weighted, src, dim=0, dim_size=self.graph_size)  # (N, d)
 
         v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
-        # v = self.sigma(v) # 激活函数，通常不需要
-        # v = self.gamma * v  # 可学缩放，防止速度过大/过小
-        v = self.manifold.expmap(z, v, c=self.c)  # 在切空间中演化后，映射回双曲空间
-        v= self.manifold.proj(v, c=self.c)  # 确保输出在双曲圆盘上
-        return v
+        v = self.sigma(v) # 激活函数，通常不需要
+
+        # v = self.manifold.proj_tan(v, c=self.c)
+        flow = self.manifold.expmap(z, v, c=self.c)  # 在切空间中演化后，映射回双曲空间
+        flow= self.manifold.proj(flow, c=self.c)  # 确保输出在双曲圆盘上
+        return flow

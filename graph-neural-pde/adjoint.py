@@ -391,34 +391,72 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
 
     # y0_h = manifold.proj(manifold.expmap0(y0, c), c)  # hyperbolic projection of y0
 
-    dt = dt.to(y0.dtype)
-    # k1: Hyperbolic Euler step to get a point on the manifold
-    x_k1_hyperbolic = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)  # manifold (h_HEuler(t + τ)) vector at y0
-    x_k1 = manifold.logmap(y0, x_k1_hyperbolic,c)
-    k1 = manifold.proj(manifold.expmap(y0, dt * x_k1, c), c)
+    # dt = dt.to(y0.dtype)
+    # # k1: Hyperbolic Euler step to get a point on the manifold
+    # x_k1_hyperbolic = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)  # manifold (h_HEuler(t + τ)) vector at y0
+    # x_k1 = manifold.logmap(y0, x_k1_hyperbolic,c)
+    # k1 = manifold.proj(manifold.expmap(y0, dt * x_k1, c), c)
 
-    # k2: Compute intermediate point and evaluate func
-    x_k2 = manifold.logmap(y0, k1, c) / 3
-    k2 = func(t0 + dt / 3, manifold.proj(manifold.expmap(y0, dt * x_k2, c), c)) 
+    # # k2: Compute intermediate point and evaluate func
+    # x_k2 = manifold.logmap(y0, k1, c) / 3
+    # k2 = func(t0 + dt / 3, manifold.proj(manifold.expmap(y0, dt * x_k2, c), c)) 
 
-    # k3: Compute intermediate point and evaluate func
-    x_k3 = manifold.logmap(y0, k2, c) - manifold.logmap(y0, k1, c) / 3  # log(k2) - log(k1)/3
-    k3 = func(t0 + 2 * dt / 3, manifold.proj(manifold.expmap(y0, dt * x_k3, c), c))
+    # # k3: Compute intermediate point and evaluate func
+    # x_k3 = manifold.logmap(y0, k2, c) - manifold.logmap(y0, k1, c) / 3  # log(k2) - log(k1)/3
+    # k3 = func(t0 + 2 * dt / 3, manifold.proj(manifold.expmap(y0, dt * x_k3, c), c))
     
-    # k4: Compute intermediate point and evaluate func
-    x_k4 = manifold.logmap(y0, k1, c) - manifold.logmap(y0, k2, c) + manifold.logmap(y0, k3, c)  # log(k1) - log(k2) + log(k3)
-    k4 = func(t1, manifold.proj(manifold.expmap(y0, dt * x_k4, c), c), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    # # k4: Compute intermediate point and evaluate func
+    # x_k4 = manifold.logmap(y0, k1, c) - manifold.logmap(y0, k2, c) + manifold.logmap(y0, k3, c)  # log(k1) - log(k2) + log(k3)
+    # k4 = func(t1, manifold.proj(manifold.expmap(y0, dt * x_k4, c), c), perturb=Perturb.PREV if perturb else Perturb.NONE)
     
-    # Combine tangent vectors with 3/8 weights
-    # Note: k2, k3, k4 are in different tangent spaces (T_h2 M, T_h3 M, T_h4 M)
-    # Following the paper, we approximate by combining in T_y0 M after adjustment
-    x_rk4 = (manifold.logmap(y0, k1, c)  + 3 * manifold.logmap(y0, k2, c)  + 3 * manifold.logmap(y0, k3, c)  + manifold.logmap(y0, k4, c) ) * (dt / 8)
+    # # Combine tangent vectors with 3/8 weights
+    # # Note: k2, k3, k4 are in different tangent spaces (T_h2 M, T_h3 M, T_h4 M)
+    # # Following the paper, we approximate by combining in T_y0 M after adjustment
+    # x_rk4 = (manifold.logmap(y0, k1, c)  + 3 * manifold.logmap(y0, k2, c)  + 3 * manifold.logmap(y0, k3, c)  + manifold.logmap(y0, k4, c) ) * (dt / 8)
     
-    # Update state using exponential map
+    # # Update state using exponential map
 
-    y1 = manifold.proj(manifold.expmap(y0, dt * x_rk4, c), c)
+    # y1 = manifold.proj(manifold.expmap(y0, dt * x_rk4, c), c)
     
-    return y1
+    # return y1
+    
+
+    # 重新定义了 k_i , 论文中的 k_i 是在不同时空点评估的向量流 F (都是双曲空间中的点)
+    # k1: 对应论文公式 (14)
+    k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
+    
+    # k2: 对应论文公式 (13), 第一部分
+    # 首先计算中间点 y_mid_2
+    v_k1 = manifold.logmap(y0, k1, c=c)
+    x_k2 = v_k1 / 3.0           # 对于之前的步长缩放的一些调整,比原来少了一次
+    y_mid_2 = manifold.expmap(y0, (dt / 3.0) * v_k1, c=c) # 原论文公式为 exp(tau * x_k2)
+    k2 = func(t0 + dt / 3.0, manifold.proj(y_mid_2, c=c))
+
+    # k3: 对应论文公式 (13), 第二部分
+    v_k2 = manifold.logmap(y0, k2, c=c)
+    x_k3 = v_k2 - v_k1 / 3.0
+    y_mid_3 = manifold.expmap(y0, dt * x_k3, c=c)
+    k3 = func(t0 + 2.0 * dt / 3.0, manifold.proj(y_mid_3, c=c))
+
+    # k4: 对应论文公式 (13), 第三部分
+    v_k3 = manifold.logmap(y0, k3, c=c)
+    x_k4 = v_k1 - v_k2 + v_k3
+    y_mid_4 = manifold.expmap(y0, dt * x_k4, c=c)
+    k4 = func(t1, manifold.proj(y_mid_4, c=c), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    
+    # 将所有流 k_i 拉回 y0 的切空间，加权平均，然后更新   
+    # 对应论文公式 (9) 
+    v_k4 = manifold.logmap(y0, k4, c=c)
+    
+    # 使用 3/8 规则的权重 {1, 3, 3, 1} 进行加权平均 [cite: 139]
+    final_tangent_vector = (v_k1 + 3.0 * v_k2 + 3.0 * v_k3 + v_k4) / 8.0
+    
+    # 从 y0 点沿最终方向移动 dt 距离，得到 y1
+    # 对应论文公式 (8) [cite: 133]
+    y1 = manifold.expmap(y0, dt * final_tangent_vector, c=c)
+    
+    return manifold.proj(y1, c=c)
+
 
 
 def rk4_alt_step_func(func, t0, dt, t1, y0, f0=None, perturb=False):
@@ -618,10 +656,23 @@ class HyperbolicRK4(FixedGridODESolver):
         Returns:
             dy: Increment (tangent vector), f0: Initial derivative (tangent vector).
         """
-        dy = hyperbolic_rk4_step_func(func, t0, dt, t1, y0, self.manifold, perturb=self.perturb, c=1.0)
-        f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
+        # dy = hyperbolic_rk4_step_func(func, t0, dt, t1, y0, self.manifold, perturb=self.perturb, c=1.0)
+        # f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
+        
         # Compute dy as the tangent vector from y0 to y1 for compatibility
         # dy = self.manifold.logmap(y0, y1,1.0)
+
+        # 1. Calculate the next state y1 using the proper hyperbolic RK4 method.
+        y1 = hyperbolic_rk4_step_func(func, t0, dt, t1, y0, self.manifold, perturb=self.perturb, c=1.0)
+        
+        # 2. We need to return a `dy` for the parent class's `y0 + dy` update.
+        dy = y1 - y0
+
+        # 3. f0 is needed for cubic interpolation, though we may not use it. 
+        #    We can compute it for compatibility.
+        f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
+        f0 = self.manifold.logmap(y0, f0, c=1.0) # f0 should be a tangent vector for interpolation.
+
         return dy, f0
 
 

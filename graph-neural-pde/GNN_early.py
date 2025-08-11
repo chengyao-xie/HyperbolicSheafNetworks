@@ -260,7 +260,7 @@ def test(model, data, pos_encoding=None, opt=None):  # opt required for runtime 
 
 
 def main(opt):
-  dataset = get_dataset(opt, '../data', False)
+  dataset = get_dataset(opt, './data', False)
   device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
   model, data = GNNEarly(opt, dataset, device).to(device), dataset.data.to(device)
   print(opt)
@@ -318,6 +318,7 @@ if __name__ == '__main__':
                       help='% of training labels to use when --use_labels is set.')
   parser.add_argument('--planetoid_split', action='store_true',
                       help='use planetoid splits for Cora/Citeseer/Pubmed')
+  
   # GNN args
   parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension.')
   parser.add_argument('--fc_out', dest='fc_out', action='store_true',
@@ -328,7 +329,7 @@ if __name__ == '__main__':
   parser.add_argument('--optimizer', type=str, default='adam', help='One from sgd, rmsprop, adam, adagrad, adamax.')
   parser.add_argument('--lr', type=float, default=0.005, help='Learning rate.')
   parser.add_argument('--decay', type=float, default=1e-4, help='Weight decay for optimization')
-  parser.add_argument('--epoch', type=int, default=100, help='Number of training epochs per iteration.')
+  parser.add_argument('--epoch', type=int, default=200, help='Number of training epochs per iteration.')
   parser.add_argument('--alpha', type=float, default=1.0, help='Factor in front matrix A.')
   parser.add_argument('--alpha_dim', type=str, default='sc', help='choose either scalar (sc) or vector (vc) alpha')
   parser.add_argument('--no_alpha_sigmoid', dest='no_alpha_sigmoid', action='store_true',
