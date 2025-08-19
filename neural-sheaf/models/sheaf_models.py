@@ -171,4 +171,3 @@ class QuadraticFormSheafLearner(SheafLearner):
             return torch.tanh(maps).view(-1, self.out_shape[0], self.out_shape[1])
         else:
             return torch.tanh(maps).view(-1, self.out_shape[0])
-

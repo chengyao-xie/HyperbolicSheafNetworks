@@ -14,13 +14,12 @@ from models.sheaf_models import LocalConcatSheafLearner, EdgeWeightLearner
 # from torchdiffeq import odeint_adjoint
 from lib.adjoint import odeint, odeint_adjoint
 from lib.hyperbolic_geometry import PoincareBall
-from utils import MaxNFEException
 
 
 class HyperbolicLaplacianODEFunc(nn.Module):
     """Implements hyperbolic diffusion based on Equation 15 using PoincareBall."""
-    def __init__(self, 
-                d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels, 
+    def __init__(self,
+                d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels,
                 left_weights=False,
                 right_weights=False,
                 use_act=False,
@@ -39,8 +38,11 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         self.left_weights = left_weights
         self.right_weights = right_weights
         self.use_act = use_act
+        self.nfe = 0
+        self.gamma = nn.Parameter(torch.tensor(0.1))  # 新增：速度缩放，初始较小
         
         self.L = None
+        self.edge_weights = None  # 新增：初始化 edge_weights
         
         if self.left_weights:
             self.lin_left_weights = nn.Linear(self.d, self.d, bias=False)
@@ -62,8 +64,8 @@ class HyperbolicLaplacianODEFunc(nn.Module):
             x_maps = x.view(self.graph_size, -1)
             maps = self.sheaf_learner(x_maps, self.edge_index)
             if self.weight_learner is not None:
-                edge_weights = self.weight_learner(x_maps, self.edge_index)
-                L, _ = self.laplacian_builder(maps, edge_weights)
+                self.edge_weights = self.weight_learner(x_maps, self.edge_index)  # 保存 edge_weights
+                L, _ = self.laplacian_builder(maps, self.edge_weights)
             else:
                 L, _ = self.laplacian_builder(maps)
             self.L = L
@@ -81,8 +83,8 @@ class HyperbolicLaplacianODEFunc(nn.Module):
 
             
             
-        if self.nfe > self.opt["max_nfe"]:
-            raise MaxNFEException
+        # if self.nfe > self.opt["max_nfe"]:
+        #     raise RuntimeError(f"Exceeded max NFE (got {self.nfe}, max allowed {self.opt['max_nfe']})")
         self.nfe += 1
 
         # 保证形状 (N, d)
@@ -101,7 +103,11 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         logmaps = torch.clamp(logmaps, min=-10.0, max=10.0)
 
         # 权重
-        ew = self.edge_weight.unsqueeze(-1)  # (E, 1)
+        # 确保 edge_weights 存在
+        if self.edge_weights is None:
+            self.edge_weights = torch.ones(self.edge_index.size(1), device=x.device)
+            
+        ew = self.edge_weights.unsqueeze(-1)  # (E, 1)
         ew = torch.clamp(ew, min=0.0, max=10.0)
         weighted = ew * logmaps  # (E, d)
 
@@ -110,18 +116,25 @@ class HyperbolicLaplacianODEFunc(nn.Module):
 
         v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
 
-        if self.use_act:
-            # x = F.elu(x)
-            v = self.sigma(v) # 激活函数，通常不需要
+        # if self.use_act:
+        #     # x = F.elu(x)
+        #     v = self.sigma(v) # 激活函数，通常不需要
 
         # v = self.manifold.proj_tan(v, c=self.c)
 
-        v = self.manifold.expmap(z, v, c=self.c)  # 在切空间中演化后，映射回双曲空间
-        v= self.manifold.proj(v, c=self.c)  # 确保输出在双曲圆盘上
+        # 应用 gamma 缩放因子
+        v = self.gamma * v
+        
+        # 在切空间中演化后，映射回双曲空间
+        v = self.manifold.expmap(z, v, c=self.c)
+        # 确保输出在双曲圆盘上
+        v = self.manifold.proj(v, c=self.c)
 
+        # 确保输出形状与输入形状一致
+        v = v.view(-1)  # Reshape to (graph_size * d,)
 
         
-        return v # Shape: (graph_size * d, 1)
+        return v # Shape: (graph_size * d,)
 
 class LaplacianODEFunc(nn.Module):
     """Implements Laplacian-based diffusion."""
@@ -216,29 +229,44 @@ class ODEBlock(nn.Module):
         self.rtol_adjoint = 1e-9
 
     def forward(self, x):
+        # 确保使用支持的求解器方法
+        int_method = self.opt.get('int_method', 'hyperbolic_rk4')
+        if int_method == 'dopri5':
+            print("[WARNING] Dopri5 solver is not implemented, switching to hyperbolic_rk4")
+            int_method = 'hyperbolic_rk4'
+            
+        adjoint_method = self.opt.get('adjoint_method', 'rk4')
+        if adjoint_method == 'dopri5':
+            print("[WARNING] Dopri5 adjoint solver is not implemented, switching to rk4")
+            adjoint_method = 'rk4'
+
         if self.opt["adjoint"] and self.training:
             print('111111111111111')
             z = odeint_adjoint(
                 self.odefunc, x, self.t,
-                method=self.opt['int_method'], # set the numerical solver: hyperbolic_rk4, rk4, dopri5
+                method=int_method, # 使用修正后的方法
                 options=dict(step_size=self.opt['step_size'], max_iters=self.opt['max_iters'], manifold=self.manifold),
-                adjoint_method=self.opt['adjoint_method'], # "set the numerical solver for the backward pass: dopri5, euler, rk4, midpoint")
-                adjoint_options=dict(step_size=self.opt['adjoint_step_size'], max_iters=self.opt['max_iters']),
+                adjoint_method=adjoint_method, # 使用修正后的方法
+                adjoint_options=dict(step_size=self.opt['adjoint_step_size'], max_iters=self.opt['max_iters'], manifold=self.manifold),
                 atol=self.atol,
                 rtol=self.rtol,
                 adjoint_atol=self.atol_adjoint,
                 adjoint_rtol=self.rtol_adjoint)
         else:
             #print('222222222222')
-            print('odeint training')
+            # print('odeint training')
             z = odeint(
                 self.odefunc, x, self.t,
-                method=self.opt['int_method'],
-                options=dict(step_size=self.opt['step_size'], max_iters=self.opt['max_iters'],  manifold=self.manifold),
+                method=int_method, # 使用修正后的方法
+                options=dict(step_size=self.opt['step_size'], max_iters=self.opt['max_iters'], manifold=self.manifold),
                 atol=self.atol,
                 rtol=self.rtol)
         self.odefunc.L = None
-        z = z[1]
+        # For fixed step solvers, we need to extract the last element
+        if isinstance(z, torch.Tensor):
+            z = z[-1]
+        else:
+            z = z[1]
         return z
 
 
@@ -252,6 +280,8 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
         self.c = 1.0 # hyperbolic curvature
         print("input_dim:", self.input_dim)
         
+        if not hasattr(self, 'int_method'):
+            self.int_method = 'hyperbolic_rk4'
     
         # Input projection to hyperbolic space
         self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
@@ -259,8 +289,7 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
             self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
 
-
-        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, edge_index)
+        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, (self.d,))
         # self.laplacian_builder = lb.NormConnectionLaplacianBuilder(
         #     self.graph_size, edge_index, d=self.d, add_hp=self.add_hp,
         #     add_lp=self.add_lp, orth_map=self.orth_trans)
@@ -292,12 +321,14 @@ class HyperbolicGraphDiffusion(SheafDiffusion):
         x = self.manifold.proj(self.manifold.expmap0(self.manifold.proj_tan0(x, self.c), c=self.c), c=self.c)
 
         if self.t > 0:
-            x = x.view(self.graph_size * self.d, -1)  # (graph_size * d, 1)
+            x = x.view(-1)  # (graph_size * d,)
             x = self.odeblock(x)  # Apply hyperbolic diffusion
+            # Reshape back to (graph_size, d) after ODE integration
+            x = x.view(self.graph_size, -1)
 
-        x = self.manifold.logmap0(x,self.c)  # Project back to Poincaré disk
+        # Project back to tangent space at origin for classification
+        x = self.manifold.logmap0(x, self.c)
 
-        x = x.view(self.graph_size, -1)  # (graph_size, d)
         x = self.lin2(x)  # Map to output dimension
 
         out = F.log_softmax(x, dim=1)

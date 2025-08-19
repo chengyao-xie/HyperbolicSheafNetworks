@@ -254,7 +254,7 @@ def _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS):
     else:
         options = options.copy()
     if method is None:
-        method = 'dopri5'
+        method = 'hyperbolic_rk4'
     if method not in SOLVERS:
         raise ValueError('Invalid method "{}". Must be one of {}'.format(method,
                                                                          '{"' + '", "'.join(SOLVERS.keys()) + '"}.'))
@@ -625,7 +625,7 @@ class HyperbolicRK4(FixedGridODESolver):
     """
     order = 4
     
-    def __init__(self, func, y0, step_size=None, grid_constructor=None, interp="linear", perturb=False, manifold=None, **unused_kwargs):
+    def __init__(self, func, y0, step_size=None, grid_constructor=None, interp="hyperbolic", perturb=False, manifold=None, **unused_kwargs):
         """
         Args:
             func: ODE dynamics function.
@@ -636,7 +636,11 @@ class HyperbolicRK4(FixedGridODESolver):
             perturb: Whether to perturb time evaluations.
             manifold: Manifold object with expmap and logmap methods.
         """
-        super().__init__(func, y0, step_size=step_size, grid_constructor=grid_constructor, interp=interp, perturb=perturb, manifold=manifold,  **unused_kwargs)
+        # 处理 unused_kwargs 中的 manifold 参数
+        if manifold is None and 'manifold' in unused_kwargs:
+            manifold = unused_kwargs.pop('manifold')
+            
+        super().__init__(func, y0, step_size=step_size, grid_constructor=grid_constructor, interp=interp, perturb=perturb, manifold=manifold, **unused_kwargs)
         self.manifold = manifold
         #self.curvature = options.get("c", 1.0)
         if manifold is None:
@@ -677,8 +681,8 @@ class HyperbolicRK4(FixedGridODESolver):
 
 
 
-class Dopri5Solver():
-    print("Dopri5Solver is not implemented yet. Please use RK4 or another solver.")
+# class Dopri5Solver():
+    # print("Dopri5Solver is not implemented yet. Please use RK4 or another solver.")
 
 SOLVERS = {
     'rk4': RK4,
@@ -757,9 +761,9 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
 
     shapes, func, y0, t, rtol, atol, method, options, _, _ = _check_inputs(func, y0, t, rtol, atol, method, options, None, SOLVERS)
 
-    assert method == "dopri5"
+    assert method == "hyperbolic_rk4"
 
-    solver = Dopri5Solver(func=func, y0=y0, rtol=rtol, atol=atol, **options)    
+    solver = HyperbolicRK4(func=func, y0=y0, rtol=rtol, atol=atol, **options)    
     
     # The integration loop
     solution = torch.empty(len(t), *solver.y0.shape, dtype=solver.y0.dtype, device=solver.y0.device)
@@ -960,18 +964,40 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     _y = torch.as_strided(y, (), ())  # noqa
                     _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
 
-                    vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
-                        func_eval, (t, y) + adjoint_params, -adj_y,
-                        allow_unused=True, retain_graph=True
-                    )
+                # 添加梯度裁剪防止爆炸
+                clip_value = 5.0  # 经验阈值
+                
+                with torch.no_grad():
+                    # 计算梯度前先detach防止影响计算图
+                    detached_adj_y = adj_y.detach()
+                
+                # 计算梯度
+                grads = torch.autograd.grad(
+                    func_eval, (t, y) + adjoint_params, -detached_adj_y,
+                    allow_unused=True, retain_graph=True
+                )
+                vjp_t, vjp_y, *vjp_params = grads
+                
+                # 应用梯度裁剪
+                if vjp_t is not None:
+                    vjp_t = torch.clamp(vjp_t, -clip_value, clip_value)
+                if vjp_y is not None:
+                    vjp_y = torch.clamp(vjp_y, -clip_value, clip_value)
+                vjp_params = [
+                    torch.clamp(vjp_param, -clip_value, clip_value) if vjp_param is not None 
+                    else torch.zeros_like(param) 
+                    for param, vjp_param in zip(adjoint_params, vjp_params)
+                ]
 
-                # autograd.grad returns None if no gradient, set to zero.
-                vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
-                vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
-                vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
-                              for param, vjp_param in zip(adjoint_params, vjp_params)]
+            # 确保梯度不为None
+            vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
+            vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
+            vjp_params = [
+                torch.zeros_like(param) if vjp_param is None else vjp_param
+                for param, vjp_param in zip(adjoint_params, vjp_params)
+            ]
 
-                return (vjp_t, func_eval, vjp_y, *vjp_params)
+            return (vjp_t, func_eval, vjp_y, *vjp_params)
 
             # Add adjoint callbacks
             for callback_name, adjoint_callback_name in zip(_all_callback_names, _all_adjoint_callback_names):
