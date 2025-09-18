@@ -13,7 +13,7 @@ python -m exp.run \
     --input_dropout=0 \
     --layers=2 \
     --lr=0.02 \
-    --model=BundleSheaf \
+    --model=HyperbolicSheafODE \
     --orth=householder \
     --sheaf_act=tanh \
     --weight_decay=0.0006685729356079199 \

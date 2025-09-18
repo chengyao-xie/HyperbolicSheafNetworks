@@ -66,7 +66,7 @@ class BrainNetworkDataset(InMemoryDataset):
             print(f"  ts_path: {ts_path}")
 
             if corr_path is None or ts_path is None:
-                print(f"  ✘ Missing files for {subject}, skipped.")
+                print(f"Missing files for {subject}, skipped.")
                 continue
 
             try:
@@ -74,7 +74,7 @@ class BrainNetworkDataset(InMemoryDataset):
                 ts = self.load_mat_file(ts_path)
 
                 if corr.shape != (116, 116) or ts.shape[1] != 116:
-                    print(f"  ✘ Shape mismatch for {subject}, skipped.")
+                    print(f"Shape mismatch for {subject}, skipped.")
                     continue
 
                 node_features = np.mean(ts, axis=0)
@@ -89,7 +89,7 @@ class BrainNetworkDataset(InMemoryDataset):
                             edge_index.append([j, i])
 
                 if len(edge_index) == 0:
-                    print(f"  ✘ No edges after thresholding, skipped.")
+                    print(f"No edges after thresholding, skipped.")
                     continue
 
                 edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
@@ -100,10 +100,10 @@ class BrainNetworkDataset(InMemoryDataset):
                 data = Data(x=x, edge_index=edge_index, y=y)
                 data.subject_id = subject
                 data_list.append(data)
-                print(f"  ✓ Added graph for {subject} with {edge_index.size(1)} edges.")
+                print(f"Added graph for {subject} with {edge_index.size(1)} edges.")
 
             except Exception as e:
-                print(f"  ✘ Error processing {subject}: {e}")
+                print(f"Error processing {subject}: {e}")
                 continue
 
         if len(data_list) == 0:
@@ -119,7 +119,7 @@ class BrainNetworkDataset(InMemoryDataset):
         return f'{self.name.capitalize()}BrainDataset(threshold={self.threshold})'
 
 if __name__ == "__main__":
-    dataset = BrainNetworkDataset(root='D:/脑网络', name='neurocon', threshold=0.7)
+    dataset = BrainNetworkDataset(root='./data', name='neurocon', threshold=0.7)
     print(f"Dataset: {dataset}")
     print(f"Number of graphs: {len(dataset)}")
     print(f"Number of node features: {dataset.num_features}")

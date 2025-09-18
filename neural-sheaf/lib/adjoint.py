@@ -423,26 +423,38 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
 
     # 重新定义了 k_i , 论文中的 k_i 是在不同时空点评估的向量流 F (都是双曲空间中的点)
     # k1: 对应论文公式 (14)
-    k1 = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
+    k1_raw = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
+    k1 = manifold.proj(k1_raw, c=c)  # 确保在流形上
     
     # k2: 对应论文公式 (13), 第一部分
     # 首先计算中间点 y_mid_2
     v_k1 = manifold.logmap(y0, k1, c=c)
-    x_k2 = v_k1 / 3.0           # 对于之前的步长缩放的一些调整,比原来少了一次
-    y_mid_2 = manifold.expmap(y0, (dt / 3.0) * v_k1, c=c) # 原论文公式为 exp(tau * x_k2)
-    k2 = func(t0 + dt / 3.0, manifold.proj(y_mid_2, c=c))
+    # x_k2 = v_k1 / 3.0           # 对于之前的步长缩放的一些调整,比原来少了一次
+    # y_mid_2 = manifold.expmap(y0, (dt / 3.0) * v_k1, c=c) # 原论文公式为 exp(tau * x_k2)
+    # k2 = func(t0 + dt / 3.0, manifold.proj(y_mid_2, c=c))
+    x_k2 = v_k1 / 3.0
+    y_mid_2 = manifold.expmap(y0, (dt / 3.0) * x_k2, c=c)
+    y_mid_2 = manifold.proj(y_mid_2, c=c)  # 投影确保在流形上
+    k2_raw = func(t0 + dt / 3.0, y_mid_2)
+    k2 = manifold.proj(k2_raw, c=c)
 
     # k3: 对应论文公式 (13), 第二部分
     v_k2 = manifold.logmap(y0, k2, c=c)
     x_k3 = v_k2 - v_k1 / 3.0
     y_mid_3 = manifold.expmap(y0, dt * x_k3, c=c)
-    k3 = func(t0 + 2.0 * dt / 3.0, manifold.proj(y_mid_3, c=c))
+    # k3 = func(t0 + 2.0 * dt / 3.0, manifold.proj(y_mid_3, c=c))
+    y_mid_3 = manifold.proj(y_mid_3, c=c)  # 投影确保在流形上
+    k3_raw = func(t0 + 2.0 * dt / 3.0, y_mid_3)
+    k3 = manifold.proj(k3_raw, c=c)
 
     # k4: 对应论文公式 (13), 第三部分
     v_k3 = manifold.logmap(y0, k3, c=c)
     x_k4 = v_k1 - v_k2 + v_k3
     y_mid_4 = manifold.expmap(y0, dt * x_k4, c=c)
-    k4 = func(t1, manifold.proj(y_mid_4, c=c), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    # k4 = func(t1, manifold.proj(y_mid_4, c=c), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    y_mid_4 = manifold.proj(y_mid_4, c=c)  # 投影确保在流形上
+    k4_raw = func(t1, y_mid_4, perturb=Perturb.PREV if perturb else Perturb.NONE)
+    k4 = manifold.proj(k4_raw, c=c)
     
     # 将所有流 k_i 拉回 y0 的切空间，加权平均，然后更新   
     # 对应论文公式 (9) 
@@ -451,13 +463,15 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
     # 使用 3/8 规则的权重 {1, 3, 3, 1} 进行加权平均 [cite: 139]
     final_tangent_vector = (v_k1 + 3.0 * v_k2 + 3.0 * v_k3 + v_k4) / 8.0
     
+    # 限制切向量的范数防止爆炸 cite ?
+    final_tangent_vector = torch.clamp(final_tangent_vector, min=-5.0, max=5.0)
+    
     # 从 y0 点沿最终方向移动 dt 距离，得到 y1
     # 对应论文公式 (8) [cite: 133]
     y1 = manifold.expmap(y0, dt * final_tangent_vector, c=c)
     
-    return manifold.proj(y1, c=c)
-
-
+    return manifold.proj(y1, c=c)  # 最终投影确保在流形上
+    
 
 def rk4_alt_step_func(func, t0, dt, t1, y0, f0=None, perturb=False):
     """Smaller error with slightly more compute."""
@@ -965,7 +979,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
 
                 # 添加梯度裁剪防止爆炸
-                clip_value = 5.0  # 经验阈值
+                clip_value = 5.0  # 经验阈值，可调整
                 
                 with torch.no_grad():
                     # 计算梯度前先detach防止影响计算图
@@ -1142,6 +1156,45 @@ def handle_adjoint_norm_(adjoint_options, shapes, state_norm):
     def default_adjoint_norm(tensor_tuple):
         t, y, adj_y, *adj_params = tensor_tuple
         # (If the state is actually a flattened tuple then this will be unpacked again in state_norm.)
+        return max(t.abs(), state_norm(y), state_norm(adj_y), _mixed_norm(adj_params))
+
+    if "norm" not in adjoint_options:
+        # `adjoint_options` was not explicitly specified by the user. Use the default norm.
+        adjoint_options["norm"] = default_adjoint_norm
+    else:
+        # `adjoint_options` was explicitly specified by the user...
+        try:
+            adjoint_norm = adjoint_options['norm']
+        except KeyError:
+            # ...but they did not specify the norm argument. Back to plan A: use the default norm.
+            adjoint_options['norm'] = default_adjoint_norm
+        else:
+            # ...and they did specify the norm argument.
+            if adjoint_norm == 'seminorm':
+                # They told us they want to use seminorms. Slight modification to plan A: use the default norm,
+                # but ignore the parameter state
+                def adjoint_seminorm(tensor_tuple):
+                    t, y, adj_y, *adj_params = tensor_tuple
+                    # (If the state is actually a flattened tuple then this will be unpacked again in state_norm.)
+                    return max(t.abs(), state_norm(y), state_norm(adj_y))
+                adjoint_options['norm'] = adjoint_seminorm
+            else:
+                # And they're using their own custom norm.
+                if shapes is None:
+                    # The state on the forward pass was a tensor, not a tuple. We don't need to do anything, they're
+                    # already going to get given the full adjoint state as (t, y, adj_y, adj_params)
+                    pass  # this branch included for clarity
+                else:
+                    # This is the bit that is tuple/tensor abstraction-breaking, because the odeint machinery
+                    # doesn't know about the tupled nature of the forward state. We need to tell the user's adjoint
+                    # norm about that ourselves.
+
+                    def _adjoint_norm(tensor_tuple):
+                        t, y, adj_y, *adj_params = tensor_tuple
+                        y = _flat_to_shape(y, (), shapes)
+                        adj_y = _flat_to_shape(adj_y, (), shapes)
+                        return adjoint_norm((t, *y, *adj_y, *adj_params))
+                    adjoint_options['norm'] = _adjoint_norm
         return max(t.abs(), state_norm(y), state_norm(adj_y), _mixed_norm(adj_params))
 
     if "norm" not in adjoint_options:

@@ -1,3 +1,34 @@
-#!/bin/sh
+#!/bin/bash
 
-python -m exp.run     --dataset=brain   --add_lp=True   --d=3     --layers=4     --hidden_channels=20     --left_weights=True     --right_weights=True     --lr=0.001     --weight_decay=5e-3     --input_dropout=0.0     --dropout=0.7     --use_act=True     --model=HyperbolicSheafODE --normalised=True     --sparse_learner=True  --int_method=hyperbolic_rk4   --entity="${ENTITY}"
+python -m exp.run \
+    --dataset=abide \
+    --task=graph_classification \
+    --num_classes=2 \
+    --pool_type=mean \
+    --add_lp=False \
+    --d=1 \
+    --layers=1 \
+    --hidden_channels=8 \
+    --left_weights=False \
+    --right_weights=False \
+    --epochs=30 \
+    --lr=0.1 \
+    --weight_decay=0.001 \
+    --sheaf_decay=0.001 \
+    --input_dropout=0.1 \
+    --dropout=0.1 \
+    --use_act=False \
+    --model=HyperbolicSheafODE \
+    --normalised=True \
+    --sparse_learner=False \
+    --int_method=hyperbolic_rk4 \
+    --step_size=0.01 \
+    --max_t=0.1 \
+    --warm_start=1 \
+    --grad_clip=1.0 \
+    --early_stopping=10 \
+    --lr_patience=3 \
+    --entity="${ENTITY}" \
+    --use_contrastive=False \
+    --eval_every=1 \
+    --folds=10

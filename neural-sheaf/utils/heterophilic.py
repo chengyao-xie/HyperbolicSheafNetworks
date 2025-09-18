@@ -12,6 +12,7 @@ from torch_geometric.data import InMemoryDataset, download_url, Data
 from torch_geometric.utils.undirected import to_undirected
 from torch_geometric.utils import remove_self_loops
 from utils.classic import Planetoid
+from utils.pyG import BrainGraphDataset
 from definitions import ROOT_DIR
 
 
@@ -225,7 +226,7 @@ class WebKB(InMemoryDataset):
         assert self.name in ['cornell', 'texas', 'washington', 'wisconsin']
 
         super(WebKB, self).__init__(root, transform, pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def raw_dir(self):
@@ -274,7 +275,8 @@ class WebKB(InMemoryDataset):
 
 
 def get_fixed_splits(data, dataset_name, seed):
-    with np.load(f'splits/splits/{dataset_name}_split_{seed}.npz') as splits_file:
+    with np.load(f'splits/graph/{dataset_name}_split_0.6_0.2_{seed}.npz') as splits_file:
+
         train_mask = splits_file['train_mask']
         val_mask = splits_file['val_mask']
         test_mask = splits_file['test_mask']
@@ -307,8 +309,12 @@ def get_dataset(name):
         dataset = Actor(root=data_root, transform=T.NormalizeFeatures())
     elif name in ['cora', 'citeseer', 'pubmed']:
         dataset = Planetoid(root=data_root, name=name, transform=T.NormalizeFeatures())
-    elif name == 'brain':
-        dataset = torch.load("./brain_node_labeled_dataset_cind.pt")
+    elif name in ['abide', 'Matai', 'neurocon', 'ppmi', 'taowu']:
+        #  图分类任务
+        root_dir = osp.join(osp.dirname(__file__), '..', 'data', name)
+        dataset = BrainGraphDataset(root=root_dir, threshold=0.1, dataset_name=name, transform=T.NormalizeFeatures())
+        # 为图分类任务设置属性
+        dataset.name = name
     else:
         raise ValueError(f'dataset {name} not supported in dataloader')
 

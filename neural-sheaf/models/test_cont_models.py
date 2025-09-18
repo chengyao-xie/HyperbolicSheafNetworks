@@ -34,7 +34,7 @@ def get_test_config():
         'max_t': 1.0,
         'sheaf_act': 'tanh',
         'tol_scale': 1.0,
-        'int_method': 'euler',
+        'int_method': 'hyperbolic_rk4',
         'step_size': 0.1,
         'max_iters': 100,
         'tol_scale_adjoint': 1.0,
