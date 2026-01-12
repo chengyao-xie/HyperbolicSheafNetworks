@@ -11,8 +11,8 @@ import pickle
 
 from scipy.sparse import linalg, diags
 from torch_geometric.utils import to_scipy_sparse_matrix
-from definitions import ROOT_DIR
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POS_ENC_PATH = os.path.join(ROOT_DIR, "datasets", "pos_encodings")
 
 

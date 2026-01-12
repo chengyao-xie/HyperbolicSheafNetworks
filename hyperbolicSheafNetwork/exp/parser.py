@@ -20,7 +20,7 @@ def get_parser():
     # ========== 优化器参数 ==========
     parser.add_argument('--epochs', type=int, default=300,  
                         help="Maximum training epochs")
-    parser.add_argument('--lr', type=float, default=0.01,  
+    parser.add_argument('--lr', type=float, default=0.005,  
                         help="Learning rate")
     parser.add_argument('--weight_decay', type=float, default=5e-4,  
                         help="Weight decay for regularization")
@@ -40,11 +40,11 @@ def get_parser():
                         help="Number of ODE blocks/layers")
     parser.add_argument('--d', type=int, default=2,
                         help="Sheaf stalk dimension")
-    parser.add_argument('--hidden_channels', type=int, default=128,  
+    parser.add_argument('--hidden_channels', type=int, default=256,  
                         help="Hidden dimension size")
-    parser.add_argument('--input_dropout', type=float, default=0.1,  
+    parser.add_argument('--input_dropout', type=float, default=0.5,  
                         help="Dropout rate for input layer")
-    parser.add_argument('--dropout', type=float, default=0.2, 
+    parser.add_argument('--dropout', type=float, default=0.5, 
                         help="Dropout rate for hidden layers")
     parser.add_argument('--left_weights', type=str2bool, default=True,
                         help="Apply left linear layer in ODE")
@@ -58,26 +58,30 @@ def get_parser():
                         help="Add fixed low-pass filter in restriction maps")
     parser.add_argument('--add_hp', type=str2bool, default=False,
                         help="Add fixed high-pass filter in restriction maps")
-    parser.add_argument('--residual', type=str2bool, default=True,
-                        help="Use residual connections")
     parser.add_argument('--sheaf_act', type=str, default="tanh",
                         help="Activation function in sheaf learner")
 
     # ========== 图分类参数 ==========
-    parser.add_argument('--num_classes', type=int, default=2,
-                        help="Number of classes (default: 2 for binary classification)")
     parser.add_argument('--pool_type', type=str, default='attention',
                         choices=['mean', 'max', 'sum', 'attention'],
                         help="Graph pooling method")
 
+    # ========== 脑网络阶数 ==========
+    parser.add_argument('--network_order', type=int, choices=[1, 2], default=1,
+                        help="1 for first-order (default FC), 2 for second-order brain networks")
+
     # ========== ODE 求解器参数 ==========
-    parser.add_argument('--max_t', type=float, default=0.5,  
+    parser.add_argument('--max_t', type=float, default=0.05,  
                         help="Maximum ODE integration time")
     parser.add_argument('--int_method', type=str, default='hyperbolic_rk4',
                         choices=['hyperbolic_rk4', 'rk4', 'euler', 'midpoint'],
                         help="ODE integration method")
-    parser.add_argument('--step_size', type=float, default=0.5,  
+    parser.add_argument('--step_size', type=float, default=1.0,  
                         help="Step size for fixed-step ODE solvers")
+    parser.add_argument('--curvature', type=float, default=1.0,
+                        help="Initial/Fixed curvature c of Poincaré ball; set 0 for Euclidean")
+    parser.add_argument('--learn_curvature', type=str2bool, default=True,
+                        help="Whether to learn curvature; disable to fix curvature to the given value")
     parser.add_argument('--adjoint', action='store_true',
                         help="Use adjoint method to reduce memory footprint")
     parser.add_argument('--adjoint_method', type=str, default='rk4',
@@ -93,15 +97,17 @@ def get_parser():
     # ========== 实验参数 ==========
     parser.add_argument('--dataset', type=str, default='abide',
                         help="Dataset name: abide, ppmi, etc.")
+    parser.add_argument('--graph_type', type=str, default='correlation',
+                        choices=['correlation', 'causality'],
+                        help="Type of brain graph: correlation or causality")
     parser.add_argument('--seed', type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument('--cuda', type=int, default=0,
                         help="CUDA device ID")
-    parser.add_argument('--folds', type=int, default=10,
-                        help="Number of cross-validation folds")
-    parser.add_argument('--model', type=str, default='HyperbolicSheafODE',
-                        choices=['HyperbolicSheafODE'],
-                        help="Model type (only HyperbolicSheafODE supported)")
+    parser.add_argument('--repeats', type=int, default=5,
+                        help="Number of random repeats with different splits")
+    parser.add_argument('--max_nfe', type=int, default=5000,
+                        help="Maximum number of function evaluations for ODE solver")
 
     # ========== 训练加速 ==========
     parser.add_argument('--use_amp', type=str2bool, default=True,

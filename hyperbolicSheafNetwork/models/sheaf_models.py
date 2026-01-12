@@ -34,10 +34,8 @@ class LocalConcatSheafLearner(SheafLearner):
         self.out_shape = out_shape
         self.linear1 = torch.nn.Linear(in_channels*2, int(np.prod(out_shape)), bias=False)
 
-        # 修改初始化方式
         nn.init.kaiming_normal_(self.linear1.weight, mode='fan_out', nonlinearity='leaky_relu')
 
-        # 修改激活函数
         if sheaf_act == 'leaky_relu':
             self.act = nn.LeakyReLU(negative_slope=0.2)
         elif sheaf_act == 'tanh':
