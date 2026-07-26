@@ -24,6 +24,94 @@ class SheafLearner(nn.Module):
     def set_L(self, weights):
         self.L = weights.clone().detach()
 
+#based on LocalConcatSheafLearner
+class LocalConcatHodgeSheafLearner(SheafLearner):
+    """Learns a sheaf by concatenating the local node features and passing them through a linear layer + activation."""
+
+    # def __init__(self, in_channels: int, out_shape: Tuple[int, ...], sheaf_act="tanh"):
+    #     super(LocalConcatSheafLearner, self).__init__()
+    #     assert len(out_shape) in [1, 2]
+    #     self.out_shape = out_shape
+    #     self.linear1 = torch.nn.Linear(in_channels*2, int(np.prod(out_shape)), bias=False)
+
+    #     nn.init.kaiming_normal_(self.linear1.weight, mode='fan_out', nonlinearity='leaky_relu')
+
+    #     if sheaf_act == 'leaky_relu':
+    #         self.act = nn.LeakyReLU(negative_slope=0.2)
+    #     elif sheaf_act == 'tanh':
+    #         self.act = torch.tanh
+    #     elif sheaf_act == 'elu':
+    #         self.act = F.elu
+    #     else:
+    #         raise ValueError(f"Unsupported act {sheaf_act}")
+    def __init__(self, in_channels: int, out_shape:  Tuple[int, ...], sheaf_act="tanh"):
+        super().__init__()
+        assert len(out_shape) in [1, 2] 
+        # according to my understanding, node -> edge the out stalk dimension is 2
+        # but in 2-order data, the edge is embedded as x,
+        # so edge -> node is B1^T , the out dimension of this co-sheaf stalk is 1
+        # edge -> face is B2, the out dimension is 3
+        self.out_shape = out_shape
+        self.d = out_shape[0]
+
+        self.linear = nn.Linear(in_channels * 2, self.d, bias=False)
+        nn.init.kaiming_normal_(self.linear.weight, mode='fan_out', nonlinearity='leaky_relu')
+
+        if sheaf_act == 'leaky_relu':
+            self.act = nn.LeakyReLU(negative_slope=0.2)
+        elif sheaf_act == 'tanh':
+            self.act = torch.tanh
+        elif sheaf_act == 'elu':
+            self.act = F.elu
+        else:
+            raise ValueError(f"Unsupported sheaf_act: {sheaf_act}")
+
+        # We'll store edge_index for convenience (can be set externally)
+        self.edge_index = None
+
+    # def forward(self, x, edge_index):
+    #     row, col = edge_index
+    #     x_row = torch.index_select(x, dim=0, index=row)
+    #     x_col = torch.index_select(x, dim=0, index=col)
+    #     maps = self.linear1(torch.cat([x_row, x_col], dim=1))
+    #     maps = self.act(maps)
+
+    #     # sign = maps.sign()
+    #     # maps = maps.abs().clamp(0.05, 1.0) * sign
+
+    #     if len(self.out_shape) == 2:
+    #         return maps.view(-1, self.out_shape[0], self.out_shape[1])
+    #     else:
+    #         return maps.view(-1, self.out_shape[0])
+
+
+
+    def forward(self, x_edges: torch.Tensor, edge_index=None):
+        """
+        x_edges:     (N, in_channels) edge features matrix
+        edge_index:  (2, E) [optional – if not passed, use self.edge_index]
+
+        Returns:
+            maps: (E, d) diagonal restriction maps for each edge
+        """
+        if edge_index is None:
+            edge_index = self.edge_index
+        if edge_index is None:
+            raise ValueError("edge_index must be provided or set via .edge_index")
+
+        row, col = edge_index
+        x_row = torch.index_select(x_edges, dim=0, index=row)    # (E, in_channels)
+        x_col = torch.index_select(x_edges, dim=0, index=col)    # (E, in_channels)
+
+        concat = torch.cat([x_row, x_col], dim=1)                # (E, 2*in_channels)
+        maps = self.linear(concat)                               # (E, d)
+        maps = self.act(maps)
+
+        # Optional: clamp magnitude but preserve sign (common in sheaf papers)
+        # sign = maps.sign()
+        # maps = maps.abs().clamp_(min=0.01, max=2.0) * sign
+
+        return maps.view(-1, self.d)   # (E, d)
 
 class LocalConcatSheafLearner(SheafLearner):
     """Learns a sheaf by concatenating the local node features and passing them through a linear layer + activation."""
