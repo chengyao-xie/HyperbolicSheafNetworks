@@ -12,7 +12,7 @@ from models.sheaf_models import LocalConcatSheafLearner
 from lib.adjoint import odeint, odeint_adjoint
 from lib.hyperbolic_geometry import PoincareBall
 from utils import MaxNFEException
-
+import torch_sparse
 
 class MaxNFEException(Exception):
     """Exception raised when maximum number of function evaluations is exceeded"""
@@ -23,6 +23,8 @@ class HyperbolicLaplacianODEFunc(nn.Module):
     """Implements hyperbolic diffusion based on Equation 15 using PoincareBall."""
     def __init__(self, 
                 d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels, 
+                B1, # = edge_to_node_matrix(edges, nodes)
+                B2, # = triangle_to_edge_matrix(triangles, edges)
                 left_weights=False,
                 right_weights=False,
                 use_act=False,
@@ -36,6 +38,8 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         self.hidden_channels = hidden_channels
         self.weight_learner = weight_learner
         self.sheaf_learner = sheaf_learner  # Optional learned diffusivity
+        self.B1 = B1
+        self.B2 = B2
         self.laplacian_builder = laplacian_builder
         self.edge_index = edge_index
         self.edge_attr = edge_attr if edge_attr is not None else torch.ones(edge_index.size(1), 1)
@@ -64,15 +68,18 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         
     def forward(self, t, x):
         if self.nonlinear or self.L is None:
-            # Update the laplacian at each step.
-            x_maps = x.view(self.graph_size, -1)
-            maps = self.sheaf_learner(x_maps, self.edge_index)
-            if self.weight_learner is not None:
-                edge_weights = self.weight_learner(x_maps, self.edge_index)
-                L, _ = self.laplacian_builder(maps, edge_weights)
-            else:
-                L, _ = self.laplacian_builder(maps)
-            self.L = L
+            # # Update the laplacian at each step.
+            # x_maps = x.view(self.graph_size, -1)
+            # maps = self.sheaf_learner(x_maps, self.edge_index)
+            # if self.weight_learner is not None:
+            #     edge_weights = self.weight_learner(x_maps, self.edge_index)
+            #     L, _ = self.laplacian_builder(maps, edge_weights)
+            # else:
+            #     L, _ = self.laplacian_builder(maps)
+            # self.L = L
+
+            # 跳过sheaflearning 使用固定hodge laplacian
+            L = self.B2 @ self.B2.t() + self.B1.t() @ self.B1
         else:
             # Cache the Laplacian obtained at the first layer for the rest of the integration.
             L = self.L
@@ -96,29 +103,36 @@ class HyperbolicLaplacianODEFunc(nn.Module):
         else:
             z = x.view(self.graph_size, -1)
 
-        # 取边两端嵌入
-        src, dst = self.edge_index[0], self.edge_index[1]
-        z_src = z[src]  # (E, final_d * hidden_channels)
-        z_dst = z[dst]  # (E, final_d * hidden_channels)
+        # 1 阶 数据的扩散方程
+        # # 取边两端嵌入
+        # src, dst = self.edge_index[0], self.edge_index[1]
+        # z_src = z[src]  # (E, final_d * hidden_channels)
+        # z_dst = z[dst]  # (E, final_d * hidden_channels)
 
-        # 在超曲空间计算对数映射：log_{z_src}(z_dst)
-        logmaps = self.manifold.logmap(z_src, z_dst, c=self.c)  # (E, final_d * hidden_channels)
+        # # 在超曲空间计算对数映射：log_{z_src}(z_dst)
+        # logmaps = self.manifold.logmap(z_src, z_dst, c=self.c)  # (E, final_d * hidden_channels)
         
-        if torch.isnan(logmaps).any() or torch.isinf(logmaps).any():
-            print("Warning: NaN or Inf detected in logmaps")
-            logmaps = torch.where(torch.isfinite(logmaps), logmaps, torch.zeros_like(logmaps))
+        # if torch.isnan(logmaps).any() or torch.isinf(logmaps).any():
+        #     print("Warning: NaN or Inf detected in logmaps")
+        #     logmaps = torch.where(torch.isfinite(logmaps), logmaps, torch.zeros_like(logmaps))
         
-        logmaps = torch.clamp(logmaps, min=-5.0, max=5.0)  # 更严格的clamp
+        # logmaps = torch.clamp(logmaps, min=-5.0, max=5.0)  # 更严格的clamp
 
-        if self.edge_attr is not None:
-            ew = self.edge_attr.to(logmaps.device)
-        else:
-            ew = torch.ones(logmaps.size(0), 1, device=logmaps.device)
-        ew = torch.clamp(ew, min=0.0, max=10.0)
-        weighted = ew * logmaps  # (E, final_d * hidden_channels)
+        # if self.edge_attr is not None:
+        #     ew = self.edge_attr.to(logmaps.device)
+        # else:
+        #     ew = torch.ones(logmaps.size(0), 1, device=logmaps.device)
+        # ew = torch.clamp(ew, min=0.0, max=10.0)
+        # weighted = ew * logmaps  # (E, final_d * hidden_channels)
 
-        # 聚合到源节点
-        v = scatter_add(weighted, src, dim=0, dim_size=self.graph_size)  # (N, final_d * hidden_channels)
+        # # 聚合到源节点
+        # v = scatter_add(weighted, src, dim=0, dim_size=self.graph_size)  # (N, final_d * hidden_channels)
+
+        # 2 阶 数据扩散方程
+        x = self.manifold.logmap0(x, c=self.c)
+        
+
+        x = torch_sparse.spmm(L[0], L[1], x.size(0), x.size(0), -x)
 
         v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
 

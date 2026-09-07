@@ -107,6 +107,154 @@ class LaplacianBuilder(nn.Module):
         new_builder.train(self.training)
         return new_builder
 
+# based on DiagLaplacianBuilder
+class DiagHodgeLaplacianBuilder(LaplacianBuilder):
+    """Learns a a Sheaf Laplacian with diagonal restriction maps"""
+
+
+    # def __init__(self, size, edge_index, d, normalised=False, deg_normalised=False, add_hp=False, add_lp=False,
+    #              augmented=True):
+    #     super(DiagLaplacianBuilder, self).__init__(
+    #         size, edge_index, d, normalised, deg_normalised, add_hp, add_lp, augmented)
+
+    #     self.diag_indices, self.tril_indices = lap.compute_learnable_diag_laplacian_indices(
+    #         size, self.vertex_tril_idx, self.d, self.final_d)
+    def __init__(self, num_edges: int, node_edge_index: torch.Tensor,
+                 d: int, normalised=False, deg_normalised=False,
+                 add_hp=False, add_lp=False, augmented=True):
+        super().__init__()
+        self.num_edges = num_edges
+        self.node_edge_index = node_edge_index  # (2, E): nodes → edges
+        self.d = d
+        self.normalised = normalised
+        self.deg_normalised = deg_normalised
+        self.augmented = augmented
+        self.add_hp = add_hp
+        self.add_lp = add_lp
+
+        # Precompute edge-pair indices for edges sharing a node
+        self._compute_tril_indices()
+
+
+
+    # def normalise(self, diag, tril, row, col):
+    #     if self.normalised:
+    #         d_sqrt_inv = (diag + 1).pow(-0.5) if self.augmented else diag.pow(-0.5)
+    #         left_norm, right_norm = d_sqrt_inv[row], d_sqrt_inv[col]
+    #         tril = left_norm * tril * right_norm
+    #         diag = d_sqrt_inv * diag * d_sqrt_inv
+    #     elif self.deg_normalised:
+    #         deg_sqrt_inv = (self.deg + 1).pow(-0.5) if self.augmented else self.deg.pow(-0.5)
+    #         deg_sqrt_inv = deg_sqrt_inv.unsqueeze(-1)
+    #         deg_sqrt_inv.masked_fill_(deg_sqrt_inv == float('inf'), 0)
+    #         left_norm, right_norm = deg_sqrt_inv[row], deg_sqrt_inv[col]
+    #         tril = left_norm * tril * right_norm
+    #         diag = deg_sqrt_inv * diag * deg_sqrt_inv
+    #     return diag, tril
+    def _compute_tril_indices(self):
+        src, tgt = self.node_edge_index
+        pairs = []
+        for v in torch.unique(src):
+            incident_edges = tgt[src == v]
+            if len(incident_edges) > 1:
+                # combinations with e1 < e2
+                comb = torch.combinations(incident_edges, r=2)
+                pairs.append(comb)
+        if pairs:
+            self.tril_indices = torch.cat(pairs, dim=0).T.contiguous()  # (2, num_pairs)
+        else:
+            self.tril_indices = torch.empty((2, 0), dtype=torch.long, device=src.device)
+
+        self.diag_indices = torch.arange(self.num_edges, device=src.device)
+
+    def normalise(self, diag, tril, row, col):
+        if self.normalised:
+            d_inv_sqrt = (diag + 1).pow_(-0.5) if self.augmented else diag.pow_(-0.5)
+            tril = tril * d_inv_sqrt[row] * d_inv_sqrt[col]
+            diag = diag * d_inv_sqrt * d_inv_sqrt
+        elif self.deg_normalised:
+            # similar logic using precomputed degrees if you have them
+            pass  # add if needed
+        return diag, tril
+
+
+
+    # def forward(self, maps):
+    #     assert len(maps.size()) == 2
+    #     assert maps.size(1) == self.d
+    #     left_idx, right_idx = self.left_right_idx
+    #     tril_row, tril_col = self.vertex_tril_idx
+    #     row, _ = self.edge_index
+
+    #     # Compute the un-normalised Laplacian entries.
+    #     left_maps = torch.index_select(maps, index=left_idx, dim=0)
+    #     right_maps = torch.index_select(maps, index=right_idx, dim=0)
+    #     tril_maps = -left_maps * right_maps
+    #     saved_tril_maps = tril_maps.detach().clone()
+    #     diag_maps = scatter_add(maps**2, row, dim=0, dim_size=self.size)
+
+    #     # Normalise the entries if the normalised Laplacian is used.
+    #     diag_maps, tril_maps = self.normalise(diag_maps, tril_maps, tril_row, tril_col)
+    #     tril_indices, diag_indices = self.tril_indices, self.diag_indices
+    #     tril_maps, diag_maps = tril_maps.view(-1), diag_maps.view(-1)
+
+    #     # Append fixed diagonal values in the non-learnable dimensions.
+    #     (diag_indices, diag_maps), (tril_indices, tril_maps) = self.append_fixed_maps(
+    #         len(left_maps), diag_indices, diag_maps, tril_indices, tril_maps)
+
+    #     # Add the upper triangular part
+    #     triu_indices = torch.empty_like(tril_indices)
+    #     triu_indices[0], triu_indices[1] = tril_indices[1], tril_indices[0]
+    #     non_diag_indices, non_diag_values = lap.mergesp(tril_indices, tril_maps, triu_indices, tril_maps)
+
+    #     # Merge diagonal and non-diagonal
+    #     edge_index, weights = lap.mergesp(non_diag_indices, non_diag_values, diag_indices, diag_maps)
+
+    #     return (edge_index, weights), saved_tril_maps
+    def forward(self, maps: torch.Tensor):
+        """
+        maps: (E, d) learned restriction maps per edge
+
+        Returns:
+            (lap_edge_index, lap_weights): sparse COO for -L
+            saved_tril: for possible regularization
+        """
+        assert maps.shape == (self.num_edges, self.d)
+
+        # Diagonal: sum of squared maps (Frobenius-like norm²)
+        diag = torch.sum(maps ** 2, dim=1)           # (E,)
+
+        # Off-diagonal: - <map_i, map_j> for edges i,j sharing a node
+        if self.tril_indices.numel() > 0:
+            e1, e2 = self.tril_indices
+            tril = -torch.sum(maps[e1] * maps[e2], dim=1)  # (num_pairs,)
+        else:
+            tril = torch.empty(0, device=maps.device)
+
+        saved_tril = tril.detach().clone()
+
+        # Normalize
+        tril, diag = self.normalise(diag, tril, self.tril_indices[0], self.tril_indices[1])
+
+        # Build symmetric sparse entries
+        tril_idx = self.tril_indices
+        triu_idx = tril_idx.flip(0)  # symmetric
+
+        non_diag_idx = torch.cat([tril_idx, triu_idx], dim=1)
+        non_diag_val = torch.cat([tril, tril], dim=0)
+
+        diag_idx = self.diag_indices.unsqueeze(0).expand(2, -1)
+        all_idx = torch.cat([non_diag_idx, diag_idx], dim=1)
+        all_val = torch.cat([non_diag_val, diag], dim=0)
+
+        # For diffusion we usually want -L → negate off-diagonals (diagonal stays positive)
+        all_val[non_diag_val.numel():] = -all_val[non_diag_val.numel():]  # wait – actually adjust sign convention
+        # Better: return -L directly (positive diagonal, negative off-diag)
+        all_val = -all_val   # common convention for diffusion direction
+
+        return (all_idx, all_val), saved_tril
+
+
 
 class DiagLaplacianBuilder(LaplacianBuilder):
     """Learns a a Sheaf Laplacian with diagonal restriction maps"""
