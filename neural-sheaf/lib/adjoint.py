@@ -419,48 +419,52 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
     # return y1
     
 
-    # 重新定义了 k_i , 论文中的 k_i 是在不同时空点评估的向量流 F (都是双曲空间中的点)
+    
+    # redefine k_i, the K_i in the paper refers to the vector field F evaluated at different spacetime points (all points in hyperbolic space)
     # k1
     k1_raw = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
-    k1 = manifold.proj(k1_raw, c=c)  # 确保在流形上
-    
+    k1 = manifold.proj(k1_raw, c=c)  # ensure it's on the manifold
+
     # k2
     v_k1 = manifold.logmap(y0, k1, c=c)
-    v_k1 = torch.clamp(v_k1, min=-5.0, max=5.0)  # 添加裁剪
+    v_k1 = torch.clamp(v_k1, min=-5.0, max=5.0)  # clamp
     x_k2 = v_k1 / 3.0
     y_mid_2 = manifold.expmap((dt / 3.0) * x_k2, y0, c=c)
-    y_mid_2 = manifold.proj(y_mid_2, c=c)  # 投影确保在流形上
+    y_mid_2 = manifold.proj(y_mid_2, c=c)  # ensure it's on the manifold
     k2_raw = func(t0 + dt / 3.0, y_mid_2)
     k2 = manifold.proj(k2_raw, c=c)
 
     # k3
     v_k2 = manifold.logmap(y0, k2, c=c)
-    v_k2 = torch.clamp(v_k2, min=-5.0, max=5.0)  # 添加裁剪
+    v_k2 = torch.clamp(v_k2, min=-5.0, max=5.0)  # clamp
     x_k3 = v_k2 - v_k1 / 3.0
     y_mid_3 = manifold.expmap(dt * x_k3, y0, c=c)
-    y_mid_3 = manifold.proj(y_mid_3, c=c)  # 投影确保在流形上
+    y_mid_3 = manifold.proj(y_mid_3, c=c)  # ensure it's on the manifold
     k3_raw = func(t0 + 2.0 * dt / 3.0, y_mid_3)
     k3 = manifold.proj(k3_raw, c=c)
 
     # k4
     v_k3 = manifold.logmap(y0, k3, c=c)
-    v_k3 = torch.clamp(v_k3, min=-5.0, max=5.0)  # 添加裁剪
+    v_k3 = torch.clamp(v_k3, min=-5.0, max=5.0)  # clamp
     x_k4 = v_k1 - v_k2 + v_k3
     y_mid_4 = manifold.expmap(dt * x_k4, y0, c=c)
-    y_mid_4 = manifold.proj(y_mid_4, c=c)  # 投影确保在流形上
+    y_mid_4 = manifold.proj(y_mid_4, c=c)  # ensure it's on the manifold
     k4_raw = func(t1, y_mid_4, perturb=Perturb.PREV if perturb else Perturb.NONE)
     k4 = manifold.proj(k4_raw, c=c)
     
-    # 将所有流 k_i 拉回 y0 的切空间
+
+    # proj to tangent space at y0
     v_k4 = manifold.logmap(y0, k4, c=c)
-    v_k4 = torch.clamp(v_k4, min=-5.0, max=5.0)  # 添加裁剪
-    
-    # 使用 3/8 规则的权重
+    v_k4 = torch.clamp(v_k4, min=-5.0, max=5.0)  # clamp
+
+
+    # Note: k2, k3, k4 are in different tangent spaces (T_h2 M, T_h3 M, T_h4 M)
+    # Following the paper, we approximate by combining in T_y0 M after adjustment
     final_tangent_vector = (v_k1 + 3.0 * v_k2 + 3.0 * v_k3 + v_k4) / 8.0
     
     final_tangent_vector = torch.clamp(final_tangent_vector, min=-3.0, max=3.0)
-    
-    # 从 y0 点沿最终方向移动
+
+    # move towards the final tangent vector from y0
     y1 = manifold.expmap(dt * final_tangent_vector, y0, c=c)
     
     return manifold.proj(y1, c=c)
@@ -1006,21 +1010,21 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     _y = torch.as_strided(y, (), ())  # noqa
                     _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
 
-                # 添加梯度裁剪防止爆炸
-                clip_value = 5.0  # 经验阈值，可调整
-                
+                # clip gradients to prevent explosion
+                clip_value = 5.0  # empirical threshold, can be adjusted
+
                 with torch.no_grad():
-                    # 计算梯度前先detach防止影响计算图
+                    # detach before computing gradients to avoid affecting the computation graph
                     detached_adj_y = adj_y.detach()
-                
-                # 计算梯度
+
+                # compute gradients
                 grads = torch.autograd.grad(
                     func_eval, (t, y) + adjoint_params, -detached_adj_y,
                     allow_unused=True, retain_graph=True
                 )
                 vjp_t, vjp_y, *vjp_params = grads
-                
-                # 应用梯度裁剪
+
+                # clip gradients
                 if vjp_t is not None:
                     vjp_t = torch.clamp(vjp_t, -clip_value, clip_value)
                 if vjp_y is not None:

@@ -38,7 +38,7 @@ def tanimoto_score(A,B):
 class Artanh(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        # 加强输入裁剪范围
+        # clamp the input range
         x = x.clamp(-1 + 1e-7, 1 - 1e-7)
         ctx.save_for_backward(x)
         z = x.double()
@@ -213,16 +213,16 @@ class PoincareBall(Manifold):
 
     def expmap(self, u, p, c):
         sqrt_c = c ** 0.5
-        # 添加数值保护
+        # clamp the input range
         u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
-        
-        # 裁剪输入值防止溢出
+
+        # clamp the input values to prevent overflow
         tanh_input = (sqrt_c / 2 * self._lambda_x(p, c) * u_norm).clamp(-15, 15)
         second_term = (
                 tanh(tanh_input) * u / (sqrt_c * u_norm)
         )
         gamma_1 = self.mobius_add(p, second_term, c)
-        return self.proj(gamma_1, c)  # 确保结果在流形上
+        return self.proj(gamma_1, c)   # ensure the result is on the manifold
 
     def logmap(self, p1, p2, c):
         ##BATCH
@@ -230,8 +230,8 @@ class PoincareBall(Manifold):
         sub_norm = sub.norm(dim=-1, p=2, keepdim=True).clamp_min(self.min_norm)
         lam = self._lambda_x(p1, c)
         sqrt_c = c ** 0.5
-        
-        # 添加数值保护
+
+        # clamp the input values to prevent overflow
         artanh_input = (sqrt_c * sub_norm).clamp(-1+1e-7, 1-1e-7)
         return 2 / sqrt_c / lam * artanh(artanh_input) * sub / sub_norm
 

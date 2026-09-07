@@ -1,7 +1,8 @@
 import torch
 
 
-# 计算双向边中每条无向边的左右限制映射索引。
+
+# compute the left/right map index for each undirected edge in a bidirectional edge
 def compute_left_right_map_index(edge_index, full_matrix=False):
     """Match every directed edge with its reverse without host-device syncs."""
     if edge_index.numel() == 0:
@@ -25,7 +26,8 @@ def compute_left_right_map_index(edge_index, full_matrix=False):
     return left_right_index, edge_index.index_select(1, left_index)
 
 
-# 计算对角 sheaf Laplacian 中可学习部分的稀疏索引。
+
+# calculate learnable part sparse indices in diagonal sheaf Laplacian
 def compute_learnable_diag_laplacian_indices(size, edge_index, learned_d, total_d):
     row, col = edge_index
     device = edge_index.device
@@ -44,7 +46,7 @@ def compute_learnable_diag_laplacian_indices(size, edge_index, learned_d, total_
     return diag_indices, non_diag_indices
 
 
-# 计算固定低通/高通维度在对角 Laplacian 中的稀疏索引。
+# calculate fixed low/high frequency indices in diagonal Laplacian
 def compute_fixed_diag_laplacian_indices(size, edge_index, learned_d, total_d):
     row, col = edge_index
     device = edge_index.device
@@ -63,7 +65,7 @@ def compute_fixed_diag_laplacian_indices(size, edge_index, learned_d, total_d):
     return diag_indices, non_diag_indices
 
 
-# 合并两个没有重复条目的稀疏矩阵索引和值。
+# merge the two sparse matrix indices and values without duplicates
 def mergesp(index1, value1, index2, value2):
     index = torch.cat([index1, index2], dim=1)
     val = torch.cat([value1, value2])
