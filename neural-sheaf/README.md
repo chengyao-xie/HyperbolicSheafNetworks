@@ -1,85 +1,78 @@
-[![example workflow](https://github.com/twitter-research/neural-sheaf-diffusion/actions/workflows/python-tests.yml/badge.svg)](https://github.com/twitter-research/neural-sheaf-diffusion/actions) 
-[![License: MIT](https://img.shields.io/badge/License-Apache%202-green.svg)](https://github.com/twitter-research/neural-sheaf-diffusion/blob/main/LICENSE)
+# Hyperbolic Sheaf Neural Network for Brain Activity Classification
 
-# Neural Sheaf Diffusion
 
-This repository contains the official code for the paper 
-**[Neural Sheaf Diffusion: A Topological Perspective on Heterophily and Oversmoothing in GNNs](https://arxiv.org/abs/2202.04579) (NeurIPS 2022)**.
 
-![Sheaf Neural Networks](figures/sheaf.png)
+| 图构造 | 一阶单纯形 | 二阶单纯形 |
+| --- | --- | --- |
+| Pearson | Pearson + order 1 | Pearson + order 2 |
+| ACX 持续缩放 | ACX + order 1 | ACX + order 2 |
 
-## Getting started
+ACX 以 ROI 时间序列计算有向连续缩放强度，并保留小、中、大三个尺度的强度和可靠性；Pearson 直接使用相关矩阵。二阶模型额外使用边—点和面—边边界矩阵。
 
-We used `CUDA 10.2` for this project. To set up the environment, run the following command:
+## Work environment
 
-```bash
-conda env create --file=environment_gpu.yml
-conda activate nsd
-```
-For using another `CUDA` version, modify the version specified inside `environment_gpu.yml`. If you like to run 
-the code in a CPU-only environment, then use `environment_cpu`. 
-
-To make sure that everything is set up correctly, you can run all the tests using:
-```bash
-pytest -v .
+建议使用独立的 Python 环境，并安装 PyTorch、PyTorch Geometric 及以下依赖：
+```powershell
+pip install numpy scipy scikit-learn torch torch-geometric
 ```
 
-## Running experiments
 
-To run the experiments without a Weights & Biases (wandb) account, first disable `wandb` by running `wandb disabled`. 
-Then, for instance, to run the training procedure on `texas`, simply run the example script provided:
-```commandline
-sh ./exp/scripts/run_texas.sh
+## Data
+
+数据根目录：
+```powershell
+$env:BRAIN_DATA_ROOT = 'your/data/root'
 ```
 
-To run the experiments using `wandb`, first create a [Weights & Biases account](https://wandb.ai/site). Then run the following
-commands to log in and follow the displayed instructions:
-```bash
-wandb online
-wandb login
+目录下可包含 `abide`、`ppmi`、`taowu`、`neurocon` 和 `Matai`。每个数据集由受试者目录组成：
+
+```text
+data_root/
+└── abide/
+    └── subject_control_001/
+        ├── *_correlation*.mat
+        └── *_features_timeseries*.mat
 ```
-Then, you can run the example training procedure on `texas` via:
-```bash
-export ENTITY=<WANDB_ACCOUNT_ID>
-sh ./exp/scripts/run_texas.sh
+
+Pearson 实验读取文件名包含 `correlation` 的 `.mat` 矩阵；ACX 实验读取文件名包含 `features_timeseries` 的 ROI × time 矩阵。类别由受试者目录名识别：`control`/`baseline` 为对照，`patient`/`postseason` 为患者；PPMI 还支持 `prodromal` 与 `swedd`。
+
+## Train
+```powershell
+# Pearson
+python -m exp.train --dataset abide --construction_method pearson --simplex_order 1 --cuda 0
+python -m exp.train --dataset abide --construction_method pearson --simplex_order 2 --cuda 0
+
+# ACX；首次计算 ACX 缓存时可用多个 CPU 进程
+python -m exp.train --dataset abide --construction_method causality --simplex_order 1 --cuda 0 --preprocess_workers 4
+python -m exp.train --dataset abide --construction_method causality --simplex_order 2 --cuda 0 --preprocess_workers 4
 ```
-Scripts for the other heterophilic datasets are also provided in `exp/scripts`. 
 
-### Hyperparameter Sweeps
+首次运行会生成 `dataset/*.pt` 预处理缓存。ACX 还会在各受试者目录生成持续缩放缓存；已有缓存不会重复计算。也可以先单独预处理：
 
-To run a hyperparameter sweep, you will need a `wandb` account. Once you have an account, you can run an example
-sweep as follows:
-```bash
-export ENTITY=<WANDB_ACCOUNT_ID>
-wandb sweep --project sheaf config/orth_webkb_sweep.yml
+```powershell
+python -m utils.data_process --dataset abide --construction_method causality --simplex_order 2 --workers 4
 ```
-This will set up the sweep for a discrete bundle model on the WebKB datasets 
-as described in the yaml config at `config/orth_webkb_sweep.yml`.
 
-To run the sweep on a single GPU, simply run the command displayed on screen after running the sweep command above. 
-If you like to run the sweep on multiple GPUs, then run the following command by typing in the `SWEEP_ID` received above.
-```bash
-sh run_sweeps.sh <SWEEP_ID>
-```
-### Datasets
+训练结果保存在 `log/run_*`：`training.log` 记录训练过程.
 
-The WebKB (`texas`, `wisconsin`, `cornell`) and `film` datasets are downloaded on the fly. The
-[WikipediaNetwork datasets](https://academic.oup.com/comnet/article/9/2/cnab014/6271062) with the Geom-GCN pre-processing 
-can be downloaded from the [Geom-GCN repo](https://github.com/graphdml-uiuc-jlu/geom-gcn/tree/f1fc0d14b3b019c562737240d06ec83b07d16a8f/new_data).
-The files for the Planetoid datasets can also be found in the [Geom-GCN repo](https://github.com/graphdml-uiuc-jlu/geom-gcn/tree/master/data). 
-The downloaded files must be placed into `datasets/<DATASET_NAME>/raw/`.
+## Setting
+实验的固定超参数位于 [exp/config.py](exp/config.py)。
 
-## Credits
+## 项目结构
 
-For attribution in academic contexts, please use the bibtex entry below:
-```
-@inproceedings{
- bodnar2022neural,
- title={Neural Sheaf Diffusion: A Topological Perspective on Heterophily and Oversmoothing in {GNN}s},
- author={Cristian Bodnar and Francesco Di Giovanni and Benjamin Paul Chamberlain and Pietro Li{\`o} and Michael M. Bronstein},
- booktitle={Advances in Neural Information Processing Systems},
- editor={Alice H. Oh and Alekh Agarwal and Danielle Belgrave and Kyunghyun Cho},
- year={2022},
- url={https://openreview.net/forum?id=vbPsD-BhOZ}
-}
+```text
+exp/
+  train.py              训练入口与重复交叉验证
+  config.py             主实验固定配置
+  training.py           单折训练、验证与指标计算
+models/                 双曲 sheaf 扩散模型
+utils/
+  brain_dataset.py      样本遍历、预处理缓存与数据集对象
+  brain_io.py           MAT 文件与并行 ACX 缓存读写
+  brain_graph.py        Pearson/ACX 构图与单纯形构造
+  continuity_scaling.py ACX 持续缩放计算
+  simplicial.py         单纯形边界矩阵
+lib/                    ODE 求解与双曲几何算子
+dataset/                自动生成的图缓存
+log/                    训练结果
 ```

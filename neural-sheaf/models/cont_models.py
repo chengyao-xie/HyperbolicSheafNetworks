@@ -1,1240 +1,622 @@
-# Copyright 2022 Twitter, Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 import torch
-from torch import nn
 import torch.nn.functional as F
-import torch_sparse
-import numpy as np
-from torch_scatter import scatter_add
+from torch import nn
 
-from models.sheaf_base import SheafDiffusion
-from models import laplacian_builders as lb
-from models.sheaf_models import LocalConcatSheafLearner, EdgeWeightLearner
-# from torchdiffeq import odeint
-# from torchdiffeq import odeint_adjoint
-from lib.adjoint import odeint, odeint_adjoint
 from lib.hyperbolic_geometry import PoincareBall
-
-
-class HyperbolicLaplacianODEFunc(nn.Module):
-    """Implements hyperbolic diffusion based on Equation 15 using PoincareBall."""
-    def __init__(self,
-                d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels,
-                left_weights=False,
-                right_weights=False,
-                use_act=False,
-                nonlinear=False,
-                weight_learner=None):
-
-        super(HyperbolicLaplacianODEFunc, self).__init__()
-        self.d = d
-        self.hidden_channels = hidden_channels
-        self.weight_learner = weight_learner
-        self.sheaf_learner = sheaf_learner  # Optional learned diffusivity
-        self.laplacian_builder = laplacian_builder
-        self.edge_index = edge_index
-        self.nonlinear = nonlinear
-        self.graph_size = graph_size
-        self.left_weights = left_weights
-        self.right_weights = right_weights
-        self.use_act = use_act
-        self.nfe = 0
-        self.gamma = nn.Parameter(torch.tensor(0.01))  # 更小的初始值
-        
-        self.L = None
-        self.edge_weights = None  # New: initialize edge_weights
-        
-        if self.left_weights:
-            self.lin_left_weights = nn.Linear(self.d, self.d, bias=False)
-        if self.right_weights:
-            self.lin_right_weights = nn.Linear(self.hidden_channels, self.hidden_channels, bias=False)
-
-        # self.beta = 1.0  # Parameter for distance-based diffusivity
-        # self.sigma = nn.ReLU()  # Activation function
-        self.c = 1.0  # Curvature of Poincaré ball
-        self.manifold = PoincareBall()  # Trustworthy Poincaré ball implementation
-
-    def update_laplacian_builder(self, laplacian_builder):
-        self.edge_index = laplacian_builder.edge_index
-        self.laplacian_builder = laplacian_builder
-        
-    def forward(self, t, x):
-        if self.nonlinear or self.L is None:
-            # Update the laplacian at each step.
-            x_maps = x.view(self.graph_size, -1)
-            maps = self.sheaf_learner(x_maps, self.edge_index)
-            if self.weight_learner is not None:
-                self.edge_weights = self.weight_learner(x_maps, self.edge_index)  # Save edge_weights
-                L, _ = self.laplacian_builder(maps, self.edge_weights)
-            else:
-                L, _ = self.laplacian_builder(maps)
-            self.L = L
-        else:
-            # Cache the Laplacian obtained at the first layer for the rest of the integration.
-            L = self.L
-
-        if self.left_weights:
-            x = x.t().reshape(-1, self.d)
-            x = self.lin_left_weights(x)
-            x = x.reshape(-1, self.graph_size * self.d).t()
-
-        if self.right_weights:
-            x = self.lin_right_weights(x)
-
-            
-            
-        # if self.nfe > self.opt["max_nfe"]:
-        #     raise RuntimeError(f"Exceeded max NFE (got {self.nfe}, max allowed {self.opt['max_nfe']})")
-        self.nfe += 1
-
-        # Ensure shape (N, d)
-        if x.dim() == 2 and x.size(0) == self.graph_size:
-            z = x
-        else:
-            z = x.view(self.graph_size, -1)
-
-        # Take embeddings from both ends of the edge
-        src, dst = self.edge_index[0], self.edge_index[1]
-        z_src = z[src]  # (E, d)
-        z_dst = z[dst]  # (E, d)
-
-        # Compute log map in hyperbolic space: log_{z_src}(z_dst)
-        logmaps = self.manifold.logmap(z_src, z_dst, c=self.c)  # (E, d)
-        logmaps = torch.clamp(logmaps, min=-10.0, max=10.0)
-
-        # Weights
-        # Ensure edge_weights exist
-        if self.edge_weights is None:
-            self.edge_weights = torch.ones(self.edge_index.size(1), device=x.device)
-            
-        ew = self.edge_weights.unsqueeze(-1)  # (E, 1)
-        ew = torch.clamp(ew, min=0.0, max=10.0)
-        weighted = ew * logmaps  # (E, d)
-
-        # Aggregate to source nodes
-        v = scatter_add(weighted, src, dim=0, dim_size=self.graph_size)  # (N, d)
-
-        v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
-
-        # if self.use_act:
-        #     # x = F.elu(x)
-        #     v = self.sigma(v) # Activation function, usually not needed
-
-        # v = self.manifold.proj_tan(v, c=self.c)
-
-        # Apply gamma scaling factor with更强的约束
-        v = torch.clamp(self.gamma, min=0.001, max=0.5) * v
-        
-        # After evolution in tangent space, map back to hyperbolic space
-        v = self.manifold.expmap(z, v, c=self.c)
-        # Ensure output is on the hyperbolic disk
-        v = self.manifold.proj(v, c=self.c)
-
-        # 最终的数值稳定性检查
-        v = torch.where(torch.isfinite(v), v, torch.zeros_like(v))
-        v = torch.clamp(v, min=-5, max=5)
-        
-        # Ensure output shape matches input shape
-        v = v.view(-1)  # Reshape to (graph_size * d,)
-
-        
-        return v # Shape: (graph_size * d,)
-
-class LaplacianODEFunc(nn.Module):
-    """Implements Laplacian-based diffusion."""
-
-    def __init__(self,
-                 d, sheaf_learner, laplacian_builder, edge_index, graph_size, hidden_channels,
-                 left_weights=False,
-                 right_weights=False,
-                 use_act=False,
-                 nonlinear=False,
-                 weight_learner=None):
-        """
-        Args:
-            L: A sparse Laplacian matrix.
-        """
-        super(LaplacianODEFunc, self).__init__()
-        self.d = d
-        self.hidden_channels = hidden_channels
-        self.weight_learner = weight_learner
-        self.sheaf_learner = sheaf_learner
-        self.laplacian_builder = laplacian_builder
-        self.edge_index = edge_index
-        self.nonlinear = nonlinear
-        self.graph_size = graph_size
-        self.left_weights = left_weights
-        self.right_weights = right_weights
-        self.use_act = use_act
-        self.L = None
-
-        if self.left_weights:
-            self.lin_left_weights = nn.Linear(self.d, self.d, bias=False)
-        if self.right_weights:
-            self.lin_right_weights = nn.Linear(self.hidden_channels, self.hidden_channels, bias=False)
-
-    def update_laplacian_builder(self, laplacian_builder):
-        self.edge_index = laplacian_builder.edge_index
-        self.laplacian_builder = laplacian_builder
-
-    def forward(self, t, x):
-        if self.nonlinear or self.L is None:
-            # Update the laplacian at each step.
-            x_maps = x.view(self.graph_size, -1)
-            maps = self.sheaf_learner(x_maps, self.edge_index)
-            if self.weight_learner is not None:
-                edge_weights = self.weight_learner(x_maps, self.edge_index)
-                L, _ = self.laplacian_builder(maps, edge_weights)
-            else:
-                L, _ = self.laplacian_builder(maps)
-            self.L = L
-        else:
-            # Cache the Laplacian obtained at the first layer for the rest of the integration.
-            L = self.L
-
-        if self.left_weights:
-            x = x.t().reshape(-1, self.d)
-            x = self.lin_left_weights(x)
-            x = x.reshape(-1, self.graph_size * self.d).t()
-
-        if self.right_weights:
-            x = self.lin_right_weights(x)
-
-        x = torch_sparse.spmm(L[0], L[1], x.size(0), x.size(0), -x)
-
-        if self.use_act:
-            x = F.elu(x)
-
-        return x
-
-
-class ODEBlock(nn.Module):
-    """Module performing the ODE Integration."""
-
-    def __init__(self, odefunc, t, opt):
-        super(ODEBlock, self).__init__()
-        self.t = t
-        self.opt = opt
-        self.odefunc = odefunc
-        self.set_tol()
-        self.manifold = PoincareBall()
-
-    def set_tol(self):
-        self.atol = self.opt['tol_scale'] * 1e-7
-        self.rtol = self.opt['tol_scale'] * 1e-9
-        if self.opt['adjoint']:
-            self.atol_adjoint = self.opt['tol_scale_adjoint'] * 1e-7
-            self.rtol_adjoint = self.opt['tol_scale_adjoint'] * 1e-9
-
-    def reset_tol(self):
-        self.atol = 1e-7
-        self.rtol = 1e-9
-        self.atol_adjoint = 1e-7
-        self.rtol_adjoint = 1e-9
-
-    def forward(self, x):
-        # Ensure using supported solver method
-        int_method = self.opt.get('int_method', 'hyperbolic_rk4')
-        if int_method == 'dopri5':
-            print("[WARNING] Dopri5 solver is not implemented, switching to hyperbolic_rk4")
-            int_method = 'hyperbolic_rk4'
-            
-        adjoint_method = self.opt.get('adjoint_method', 'rk4')
-        if adjoint_method == 'dopri5':
-            print("[WARNING] Dopri5 adjoint solver is not implemented, switching to rk4")
-            adjoint_method = 'rk4'
-
-        # 仅为定步长方法传入支持的参数：step_size、manifold；移除 max_iters
-        options = dict(step_size=self.opt['step_size'], manifold=self.manifold)
-        adjoint_options = dict(step_size=self.opt['adjoint_step_size'], manifold=self.manifold)
-
-        if self.opt["adjoint"] and self.training:
-            print('111111111111111')
-            z = odeint_adjoint(
-                self.odefunc, x, self.t,
-                method=int_method,
-                options=options,
-                adjoint_method=adjoint_method,
-                adjoint_options=adjoint_options,
-                atol=self.atol,
-                rtol=self.rtol,
-                adjoint_atol=self.atol_adjoint,
-                adjoint_rtol=self.rtol_adjoint)
-        else:
-            #print('222222222222')
-            # print('odeint training')
-            z = odeint(
-                self.odefunc, x, self.t,
-                method=int_method,
-                options=options,
-                atol=self.atol,
-                rtol=self.rtol)
-        self.odefunc.L = None
-        # For fixed step solvers, we need to extract the last element
-        if isinstance(z, torch.Tensor):
-            z = z[-1]
-        else:
-            z = z[1]
-        return z
+from models import laplacian_builders as lb
+from models.hyperbolic_ode import HyperbolicLaplacianODEFunc, ODEBlock
+from models.sheaf_base import SheafDiffusion
+from models.sheaf_models import (
+    LocalConcatIncidenceSheafLearner,
+    LocalConcatSheafLearner,
+)
+from utils.continuity_scaling import ACX_SCALE_BANDS
+from utils.simplicial import boundary_to_incidence_data
 
 
 class HyperbolicGraphDiffusion(SheafDiffusion):
-    """Diffusion model using hyperbolic Laplacian ODE for graph classification."""
+    """Diffusion model using hyperbolic sheaf ODE for brain network classification."""
 
     def __init__(self, edge_index, args):
         super(HyperbolicGraphDiffusion, self).__init__(edge_index, args)
-        # Hyperbolic dimension
-        # self.d = args.get('hyperbolic_dim', 2)  # defined in the SheafDiffusion class
-        self.c = 1.0 # hyperbolic curvature
-        print("input_dim:", self.input_dim)
-        
-        # Check if it's a graph classification task
-        self.graph_classification = args.get('graph_classification', True)
-        
-        if not hasattr(self, 'int_method'):
-            self.int_method = 'hyperbolic_rk4'
-    
-        # Input projection to hyperbolic space
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
-        if self.second_linear:
-            self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-            
-        # Modify output layer for graph classification
-        if self.graph_classification:
-            # Graph-level classification: pool first then classify
-            self.pool_type = args.get('pool_type', 'mean')  # 'mean', 'max', 'sum', 'attention'
-            
-            # 注意力池化层（可选）
-            if self.pool_type == 'attention':
-                self.attention_pool = nn.Sequential(
-                    nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-                    nn.ReLU(),
-                    nn.Linear(self.hidden_dim // 2, 1)
-                )
-            
-            # 图分类器
-            self.graph_classifier = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(self.hidden_dim // 2, self.output_dim)
-            )
+        curvature = args.get('curvature', 1.0)
+        learn_curvature = args.get('learn_curvature', False)
+
+        if learn_curvature:
+            self.c_param = nn.Parameter(torch.tensor(curvature, dtype=torch.float32))
+            self.learn_curvature = True
         else:
-            # 原始节点分类
-            self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
+            self.register_buffer('c_param', torch.tensor(curvature, dtype=torch.float32))
+            self.learn_curvature = False
 
-        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, (self.d,))
-        # self.laplacian_builder = lb.NormConnectionLaplacianBuilder(
-        #     self.graph_size, edge_index, d=self.d, add_hp=self.add_hp,
-        #     add_lp=self.add_lp, orth_map=self.orth_trans)
-        self.laplacian_builder = lb.DiagLaplacianBuilder(
-            self.graph_size, edge_index, d=self.d, add_hp=self.add_hp, add_lp=self.add_lp)
-
-
-        # Define hyperbolic ODE function
-        self.odefunc = HyperbolicLaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
-            use_act=self.use_act)
-        
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-        self.manifold = PoincareBall()
-
-        # 1. Add layer normalization
-        self.layer_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.layer_norm2 = nn.LayerNorm(self.hidden_dim)
-        
-        # 2. Add residual connections
-        self.residual = args.get('residual', True)
-        
-        # 3. Modify activation function
-        self.activation = nn.LeakyReLU(negative_slope=0.2)
-        
-        # 4. Initialize parameters
-        self.reset_parameters()
-        
-    def reset_parameters(self):
-        # 更保守的Xavier初始化
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)  # 减小初始化规模
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-        self.apply(init_weights)
-        
-        # Initialize gamma to a very small value
-        with torch.no_grad():
-            if hasattr(self.odefunc, 'gamma'):
-                self.odefunc.gamma.fill_(0.01)  # 更小的初始值
-                
-    def graph_pooling(self, x, batch=None):
-        """图级别池化操作"""
-        if self.pool_type == 'mean':
-            if batch is None:
-                # 单图情况：对所有节点求平均
-                return torch.mean(x, dim=0, keepdim=True)
-            else:
-                # 批处理情况：按batch分组求平均
-                from torch_geometric.nn import global_mean_pool
-                return global_mean_pool(x, batch)
-        elif self.pool_type == 'max':
-            if batch is None:
-                return torch.max(x, dim=0, keepdim=True)[0]
-            else:
-                from torch_geometric.nn import global_max_pool
-                return global_max_pool(x, batch)
-        elif self.pool_type == 'sum':
-            if batch is None:
-                return torch.sum(x, dim=0, keepdim=True)
-            else:
-                from torch_geometric.nn import global_add_pool
-                return global_add_pool(x, batch)
-        elif self.pool_type == 'attention':
-            # 注意力池化
-            attention_weights = self.attention_pool(x)  # (N, 1)
-            attention_weights = F.softmax(attention_weights, dim=0)
-            if batch is None:
-                graph_embed = torch.sum(x * attention_weights, dim=0, keepdim=True)
-            else:
-                # 批处理的注意力池化需要按batch分组
-                graph_embed = []
-                for i in range(batch.max().item() + 1):
-                    mask = (batch == i)
-                    x_graph = x[mask]
-                    att_graph = attention_weights[mask]
-                    att_graph = F.softmax(att_graph, dim=0)
-                    graph_embed.append(torch.sum(x_graph * att_graph, dim=0))
-                graph_embed = torch.stack(graph_embed)
-            return graph_embed
+        self.edge_index = edge_index
+        self.pool_type = args.get('pool_type', 'mean')
+        self.pool_heads = int(args.get('pool_heads', 4))
+        if self.pool_type in (
+                'roi_attention', 'mean_roi_attention', 'residual_roi_attention',
+                'dual_roi_attention'):
+            roi_pool_logits = torch.zeros(self.pool_heads, self.graph_size)
+            anchor_strength = float(args.get('roi_attention_init', 0.0))
+            if anchor_strength > 0:
+                anchor_indices = torch.linspace(
+                    0, self.graph_size - 1, steps=self.pool_heads + 2)[1:-1]
+                anchor_indices = anchor_indices.round().long()
+                roi_pool_logits[
+                    torch.arange(self.pool_heads), anchor_indices] = anchor_strength
+            self.roi_pool_logits = nn.Parameter(
+                roi_pool_logits)
         else:
-            raise ValueError(f"Unknown pooling type: {self.pool_type}")
-                
-    def forward(self, x, batch=None):
-        # 1. Input processing
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        
-        # 2. First transformation layer
-        x = self.lin1(x)
-        x = self.layer_norm1(x)
-        x = self.activation(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        
-        # 3. 可选的第二个线性层
-        if self.second_linear:
-            x = self.lin12(x)
-            x = self.layer_norm2(x)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            
-        # 4. 投影到双曲空间 - 更保守的映射
-        x_norm = torch.norm(x, dim=-1, keepdim=True)
-        x_normalized = x / (x_norm + 1e-8)  # 归一化避免过大的值
-        x = self.manifold.proj(
-            self.manifold.expmap0(
-                self.manifold.proj_tan0(x_normalized * 0.5, self.c),  # 缩放因子0.5
-                c=self.c
-            ), 
-            c=self.c
+            self.register_parameter('roi_pool_logits', None)
+        if self.pool_type == 'signed_roi_attention':
+            projection_generator = torch.Generator(device='cpu')
+            projection_generator.manual_seed(1729)
+            signed_projection = torch.randn(
+                self.pool_heads, self.graph_size,
+                generator=projection_generator) * 0.1
+            self.roi_signed_logits = nn.Parameter(signed_projection)
+        else:
+            self.register_parameter('roi_signed_logits', None)
+        if self.pool_type == 'residual_roi_attention':
+            residual_init = float(args.get('roi_attention_residual_init', 0.1))
+            self.roi_pool_residual_logit = nn.Parameter(
+                torch.logit(torch.tensor(residual_init, dtype=torch.float32)))
+        else:
+            self.register_parameter('roi_pool_residual_logit', None)
+        self.use_learned_sheaf = args.get('use_learned_sheaf', True)
+        self.use_edge_features = (
+            args.get('use_edge_features', True)
+            and args.get('construction_method', 'pearson') == 'causality'
         )
-        
-        # 5. ODE integration - 添加数值稳定性检查
-        if self.t > 0:
-            x_flat = x.view(-1)
-            # 检查输入是否有效
-            if torch.isnan(x_flat).any() or torch.isinf(x_flat).any():
-                print(f"[WARNING] Invalid input to ODE: nan={torch.isnan(x_flat).any()}, inf={torch.isinf(x_flat).any()}")
-                x_flat = torch.clamp(x_flat, min=-1, max=1)
-            
-            x_evolved = self.odeblock(x_flat)
-            
-            # 检查输出是否有效
-            if torch.isnan(x_evolved).any() or torch.isinf(x_evolved).any():
-                print(f"[WARNING] Invalid ODE output: nan={torch.isnan(x_evolved).any()}, inf={torch.isinf(x_evolved).any()}")
-                x_evolved = torch.clamp(x_evolved, min=-5, max=5)
-            
-            x = x_evolved.view(self.graph_size, -1)
-        
-        # 6. Project back to Euclidean space
-        x = self.manifold.logmap0(x, self.c)
-        
-        # 最终的数值稳定性检查
-        x = torch.clamp(x, min=-10, max=10)
-        
-        # 7. 输出层
-        if self.graph_classification:
-            # Graph classification: pool first then classify
-            graph_embed = self.graph_pooling(x, batch)  # (batch_size, hidden_dim)
-            output = self.graph_classifier(graph_embed)  # (batch_size, output_dim)
-            if self.output_dim == 2:
-                # Binary classification: return single logit value (batch_size, 1)
-                return output[:, 0:1]  # Take only first column as logit
-            else:
-                # 多分类：返回log_softmax
-                return F.log_softmax(output, dim=1)
+        self.edge_scale_bands = ACX_SCALE_BANDS if self.use_edge_features else 0
+        self.sheaf_edge_channels = self.edge_scale_bands * 2
+        self.adaptive_edge_scale_gates = args.get(
+            'adaptive_edge_scale_gates', False)
+        self.adaptive_edge_scale_strength = args.get(
+            'adaptive_edge_scale_strength', 0.1)
+        self.use_fixed_hodge = args.get('use_fixed_hodge', True)
+        self.hodge_weight = args.get('hodge_weight', 1.0)
+        self.diffusion_residual = args.get('diffusion_residual', False)
+        residual_init = float(args.get('diffusion_residual_init', 0.5))
+        residual_logit = torch.logit(torch.tensor(residual_init, dtype=torch.float32))
+        self.diffusion_residual_logit = nn.Parameter(
+            residual_logit, requires_grad=self.diffusion_residual)
+        self.simplex_order = args.get('simplex_order', 2)
+        self.use_learned_hodge = (
+            self.simplex_order == 2
+            and self.use_learned_sheaf
+            and not self.use_fixed_hodge
+        )
+
+        self.multiscale_node_fusion = args.get('multiscale_node_fusion', False)
+        self.multiscale_node_bands = 0
+        encoder_input_dim = self.input_dim
+        if self.multiscale_node_fusion:
+            feature_blocks = self.input_dim // self.graph_size
+            self.multiscale_node_bands = feature_blocks - 1
+            fusion_init = float(args.get('multiscale_node_fusion_init', 0.1))
+            self.multiscale_node_scale_logits = nn.Parameter(
+                torch.zeros(self.multiscale_node_bands))
+            self.multiscale_node_fusion_logit = nn.Parameter(
+                torch.logit(torch.tensor(fusion_init, dtype=torch.float32)))
+            encoder_input_dim = self.graph_size
         else:
-            # 节点分类
-            x = self.lin2(x)
-            return F.log_softmax(x, dim=1)
+            self.register_parameter('multiscale_node_scale_logits', None)
+            self.register_parameter('multiscale_node_fusion_logit', None)
 
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.edge_index = edge_index
-        if self.diffusivity_learner is not None:
-            self.diffusivity_learner.update_edge_index(edge_index)
-
-
-class GraphLaplacianDiffusion(SheafDiffusion):
-    """This is a diffusion model based on the weighted graph Laplacian."""
-
-    def __init__(self, edge_index, args):
-        super(GraphLaplacianDiffusion, self).__init__(edge_index, args)
-        assert args['d'] == 1
-
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.lin1 = nn.Linear(encoder_input_dim, self.hidden_dim)
         if self.second_linear:
             self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
 
-        self.sheaf_learner = EdgeWeightLearner(self.hidden_dim, edge_index)
-        self.laplacian_builder = lb.DiagLaplacianBuilder(
-            self.graph_size, edge_index, d=self.d, add_hp=self.add_hp, add_lp=self.add_lp)
-
-        self.odefunc = LaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
-            use_act=self.use_act)
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.update_laplacian_builder(self.laplacian_builder)
-        self.sheaf_learner.update_edge_index(edge_index)
-
-    def forward(self, x):
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        x = self.lin1(x)
-        if self.use_act:
-            x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        if self.second_linear:
-            x = self.lin12(x)
-
-        if self.t > 0:
-            x = x.view(self.graph_size * self.final_d, -1)
-            x = self.odeblock(x)
-        x = x.view(self.graph_size, -1)
-        x = self.lin2(x)
-        return F.log_softmax(x, dim=1)
-
-
-class DiagSheafDiffusion(SheafDiffusion):
-    """Performs diffusion using a sheaf Laplacian with diagonal restriction maps."""
-
-    def __init__(self, edge_index, args):
-        super(DiagSheafDiffusion, self).__init__(edge_index, args)
-
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
-        if self.second_linear:
-            self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
-
-        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, out_shape=(self.d,), sheaf_act=self.sheaf_act)
-        self.laplacian_builder = lb.DiagLaplacianBuilder(self.graph_size, edge_index, d=self.d,
-                                                         normalised=self.normalised,
-                                                         deg_normalised=self.deg_normalised,
-                                                         add_hp=self.add_hp, add_lp=self.add_lp)
-
-        self.odefunc = LaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
-            use_act=self.use_act)
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.update_laplacian_builder(self.laplacian_builder)
-
-    def forward(self, x):
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        x = self.lin1(x)
-        if self.use_act:
-            x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        if self.second_linear:
-            x = self.lin12(x)
-
-        if self.t > 0:
-            x = x.view(self.graph_size * self.final_d, -1)
-            x = self.odeblock(x)
-        x = x.view(self.graph_size, -1)
-        x = self.lin2(x)
-        return F.log_softmax(x, dim=1)
-
-
-class BundleSheafDiffusion(SheafDiffusion):
-    """Performs diffusion using a sheaf Laplacian with diagonal restriction maps."""
-
-    def __init__(self, edge_index, args):
-        super(BundleSheafDiffusion, self).__init__(edge_index, args)
-        # Should use diagonal sheaf diffusion instead if d=1.
-        assert args['d'] > 1
-
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
-        if self.second_linear:
-            self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
-
-        self.weight_learner = EdgeWeightLearner(self.hidden_dim, edge_index) if self.use_edge_weights else None
-        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, out_shape=(self.get_param_size(),),
-                                                     sheaf_act=self.sheaf_act)
-        self.laplacian_builder = lb.NormConnectionLaplacianBuilder(
-            self.graph_size, edge_index, d=self.d, add_hp=self.add_hp,
-            add_lp=self.add_lp, orth_map=self.orth_trans)
-
-        self.odefunc = LaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
-            use_act=self.use_act, weight_learner=self.weight_learner)
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.update_laplacian_builder(self.laplacian_builder)
-        self.weight_learner.update_edge_index(edge_index)
-
-    def get_param_size(self):
-        if self.orth_trans in ['matrix_exp', 'cayley']:
-            return self.d * (self.d + 1) // 2
+        if self.pool_type in ('mean_std', 'mean_max'):
+            pooled_dim = self.hidden_dim * 2
+        elif self.pool_type == 'roi_attention':
+            pooled_dim = self.hidden_dim * self.pool_heads
+        elif self.pool_type == 'mean_roi_attention':
+            pooled_dim = self.hidden_dim * (self.pool_heads + 1)
+        elif self.pool_type == 'signed_roi_attention':
+            pooled_dim = self.hidden_dim * self.pool_heads
         else:
-            return self.d * (self.d - 1) // 2
+            pooled_dim = self.hidden_dim
+        classifier_layers = [nn.Linear(pooled_dim, self.hidden_dim)]
+        if args.get('classifier_norm', False):
+            classifier_layers.append(nn.LayerNorm(self.hidden_dim))
+        classifier_layers.extend([
+            nn.ELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.output_dim),
+        ])
+        self.classifier = nn.Sequential(*classifier_layers)
 
-    def forward(self, x):
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        x = self.lin1(x)
-        if self.use_act:
-            x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        if self.second_linear:
-            x = self.lin12(x)
-
-        if self.t > 0:
-            x = x.view(self.graph_size * self.final_d, -1)
-            x = self.odeblock(x)
-        x = x.view(self.graph_size, -1)
-        x = self.lin2(x)
-        return F.log_softmax(x, dim=1)
-
-
-class GeneralSheafDiffusion(SheafDiffusion):
-
-    def __init__(self, edge_index, args):
-        super(GeneralSheafDiffusion, self).__init__(edge_index, args)
-        # Should use diagoal diffusion if d == 1
-        assert args['d'] > 1
-
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
-        if self.second_linear:
-            self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
-
-        self.sheaf_learner = LocalConcatSheafLearner(
-            self.hidden_dim, out_shape=(self.d, self.d), sheaf_act=self.sheaf_act)
-        self.laplacian_builder = lb.GeneralLaplacianBuilder(
-            self.graph_size, edge_index, d=self.d, add_lp=self.add_lp, add_hp=self.add_hp,
-            normalised=self.normalised, deg_normalised=self.deg_normalised)
-
-        self.odefunc = LaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index, self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights, right_weights=self.right_weights,
-            use_act=self.use_act)
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.update_laplacian_builder(self.laplacian_builder)
-
-    def forward(self, x):
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        x = self.lin1(x)
-        if self.use_act:
-            x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        if self.second_linear:
-            x = self.lin12(x)
-
-        if self.t > 0:
-            x = x.view(self.graph_size * self.final_d, -1)
-            x = self.odeblock(x)
-
-        # To detect the numerical instabilities of SVD.
-        assert torch.all(torch.isfinite(x))
-
-        x = x.view(self.graph_size, -1)
-        x = self.lin2(x)
-        return F.log_softmax(x, dim=1)
-
-
-class HyperbolicGraphClassifier(nn.Module):
-    """
-    Hyperbolic Graph Classifier for brain graph classification.
-    Wraps HyperbolicGraphDiffusion for graph-level classification tasks.
-    """
-    
-    def __init__(self, edge_index, args):
-        super(HyperbolicGraphClassifier, self).__init__()
-        self.args = args
-        self.task = 'graph_classification'
-        
-        # 确保设置为图分类模式
-        if isinstance(args, dict):
-            args_copy = args.copy()
-        else:
-            args_copy = vars(args).copy()
-            
-        args_copy['graph_classification'] = True
-        args_copy['num_classes'] = args_copy.get('num_classes', 2)
-        
-        # 创建超曲图扩散模型
-        self.graph_diffusion = HyperbolicGraphDiffusion(edge_index, args_copy)
-        
-        # 损失函数
-        self.num_classes = args_copy['num_classes']
-        if self.num_classes == 2:
-            self.criterion = nn.BCEWithLogitsLoss()
-        else:
-            self.criterion = nn.CrossEntropyLoss()
-            
-        # Contrastive learning related parameters
-        self.use_contrastive = args_copy.get('use_contrastive', True)
-        self.contrastive_weight = args_copy.get('contrastive_weight', 0.5)
-        self.temperature = args_copy.get('temperature', 0.1)
-        self.projection_dim = args_copy.get('projection_dim', 128)
-        
-        # Contrastive learning projection head
-        if self.use_contrastive:
-            self.projection_head = nn.Sequential(
-                nn.Linear(self.graph_diffusion.hidden_dim, self.projection_dim),
-                nn.ReLU(),
-                nn.Linear(self.projection_dim, self.projection_dim)
+        if self.pool_type == 'dual_roi_attention':
+            rng_state = torch.random.get_rng_state()
+            self.roi_classifier = nn.Sequential(
+                nn.Linear(self.hidden_dim * self.pool_heads, self.hidden_dim),
+                nn.ELU(),
+                nn.Dropout(self.dropout),
+                nn.Linear(self.hidden_dim, self.output_dim),
             )
-            
-        # 统计信息
-        self.metrics_tracker = {}
-        
-        # 为对比学习启用epoch统计（需要在run.py中绑定相关函数后才能调用）
-        # self.reset_epoch_stats(-1, 'start') # 保持注释状态，由run.py绑定后调用
-
-    def forward(self, x, batch=None, return_embedding=False):
-        """前向传播"""
-        output = self.graph_diffusion(x, batch)
-        
-        if return_embedding and self.use_contrastive:
-            # 获取图嵌入用于对比学习
-            # 重新进行图池化获取嵌入
-            x_processed = self.graph_diffusion.lin1(x)
-            if self.graph_diffusion.second_linear:
-                x_processed = self.graph_diffusion.lin12(x_processed)
-            graph_embed = self.graph_diffusion.graph_pooling(x_processed, batch)
-            projected_embed = self.projection_head(graph_embed)
-            return output, projected_embed
-        
-        return output
-    
-    def contrastive_loss(self, embeddings_list, labels_list):
-        """
-        计算对比学习损失
-        embeddings_list: 多个图的嵌入列表
-        labels_list: 对应的标签列表
-        """
-        if len(embeddings_list) < 2:
-            return torch.tensor(0.0, device=embeddings_list[0].device)
-            
-        # Merge all embeddings and labels
-        all_embeddings = torch.cat(embeddings_list, dim=0)  # (total_graphs, projection_dim)
-        # 确保 labels 至少为 1 维，再拼接
-        safe_labels = []
-        for lbl in labels_list:
-            if lbl.dim() == 0:
-                lbl = lbl.unsqueeze(0)
-            else:
-                lbl = lbl.view(-1)
-            safe_labels.append(lbl)
-        all_labels = torch.cat(safe_labels, dim=0)  # (total_graphs,)
-        
-        # Normalize embeddings
-        all_embeddings = F.normalize(all_embeddings, p=2, dim=1)
-        
-        # Compute similarity matrix
-        similarity_matrix = torch.mm(all_embeddings, all_embeddings.t()) / self.temperature
-        
-        # Create positive sample mask (same labels)
-        labels_expanded = all_labels.unsqueeze(1)
-        pos_mask = (labels_expanded == labels_expanded.t()).float()
-        
-        # Remove diagonal elements (similarity with self)
-        pos_mask.fill_diagonal_(0)
-        
-        # Create negative sample mask
-        neg_mask = 1 - pos_mask
-        neg_mask.fill_diagonal_(0)
-        
-        # Compute contrastive loss
-        exp_sim = torch.exp(similarity_matrix)
-        
-        # Compute loss for each sample
-        total_loss = 0
-        num_positives = 0
-        
-        for i in range(len(all_labels)):
-            # Positive samples
-            pos_indices = torch.where(pos_mask[i] > 0)[0]
-            if len(pos_indices) == 0:
-                continue
-                
-            # Negative samples
-            neg_indices = torch.where(neg_mask[i] > 0)[0]
-            
-            # Compute denominator: positive samples + negative samples
-            pos_sum = exp_sim[i, pos_indices].sum()
-            neg_sum = exp_sim[i, neg_indices].sum()
-            
-            # InfoNCE loss
-            if pos_sum > 0 and (pos_sum + neg_sum) > 0:
-                loss_i = -torch.log(pos_sum / (pos_sum + neg_sum))
-                total_loss += loss_i
-                num_positives += 1
-        
-        if num_positives > 0:
-            return total_loss / num_positives
+            torch.random.set_rng_state(rng_state)
+            roi_logit_init = float(args.get('roi_logit_fusion_init', 0.05))
+            self.roi_logit_fusion_logit = nn.Parameter(
+                torch.logit(torch.tensor(roi_logit_init, dtype=torch.float32)))
         else:
-            return torch.tensor(0.0, device=all_embeddings.device)
+            self.roi_classifier = None
+            self.register_parameter('roi_logit_fusion_logit', None)
 
-    def compute_metrics_multiple(self, embeddings_list, data_list, split):
-        """
-        计算多个图的评估指标，整合对比学习
-        """
-        if not isinstance(embeddings_list, list):
-            embeddings_list = [embeddings_list]
-        if not isinstance(data_list, list):
-            data_list = [data_list]
-            
-        logits_list = []
-        labels_list = []
-        embeddings_for_contrastive = []
-        total_loss = 0
-        total_contrastive_loss = 0
-        
-        for i, (embeddings, data) in enumerate(zip(embeddings_list, data_list)):
-            # Forward propagation
-            if self.use_contrastive:
-                logits, projected_embed = self.forward(embeddings, return_embedding=True)
-                embeddings_for_contrastive.append(projected_embed)
-            else:
-                logits = self.forward(embeddings)
-            
-            # 获取标签
-            if 'graph_labels' in data:
-                labels = data['graph_labels']
-            elif 'y' in data:
-                labels = data['y']
-            elif 'labels' in data:
-                labels = data['labels']
-            else:
-                raise KeyError("No graph labels found in data")
-                
-            # 统一 labels 形状为 [N]（通常为 [1]）
-            if labels.dim() == 0:
-                labels = labels.unsqueeze(0)
-            else:
-                labels = labels.view(-1)
-                
-            # Ensure labels are on the correct device
-            if labels.device != logits.device:
-                labels = labels.to(logits.device)
-            
-            logits_list.append(logits)
-            labels_list.append(labels)
-            
-            # 计算分类损失（统一展平为 1D，避免 squeeze 变成 0D）
-            if self.num_classes == 2:
-                logits_1d = logits.view(-1)
-                labels_1d = labels.view(-1).float()
-                loss = self.criterion(logits_1d, labels_1d)
-            else:
-                loss = self.criterion(logits, labels.long())
-                
-            total_loss += loss
-        
-        # Compute contrastive learning loss
-        if self.use_contrastive and len(embeddings_for_contrastive) > 1:
-            contrastive_loss = self.contrastive_loss(embeddings_for_contrastive, labels_list)
-            total_contrastive_loss = contrastive_loss
-        else:
-            contrastive_loss = torch.tensor(0.0, device=embeddings_list[0].device if len(embeddings_list) > 0 else None)
-            total_contrastive_loss = contrastive_loss
+        self.manifold = PoincareBall()
+        self.sheaf_learners = nn.ModuleList()
+        self.hodge_down_sheaf_learners = nn.ModuleList()
+        self.hodge_up_sheaf_learners = nn.ModuleList()
+        self.laplacian_builders = nn.ModuleList()
+        self.odefuncs = nn.ModuleList()
+        self.odeblocks = nn.ModuleList()
+        self.laplacian_builder_cache = {}
+        self.hodge_laplacian_builder_cache = {}
 
-        # 对分类损失取平均，再与对比损失组合
-        num_graphs = max(1, len(logits_list))
-        avg_classification_loss = total_loss / num_graphs
-        combined_loss = avg_classification_loss + self.contrastive_weight * contrastive_loss if self.use_contrastive else avg_classification_loss
-
-        # Merge all predictions and labels for evaluation
-        all_logits = torch.cat(logits_list, dim=0)
-        all_labels = torch.cat(labels_list, dim=0)
-        
-        # Compute predictions and accuracy
-        if self.num_classes == 2:
-            # 避免 squeeze 导致 0 维
-            all_logits = all_logits.view(-1)
-            probs = torch.sigmoid(all_logits)
-            preds = (probs > 0.5).float()
-            labels_for_acc = all_labels.view(-1).float()
-        else:
-            probs = F.softmax(all_logits, dim=1)
-            preds = torch.argmax(all_logits, dim=1)
-            labels_for_acc = all_labels.view(-1).long()
-        
-        acc = (preds == labels_for_acc).float().mean()
-        
-        # Compute other metrics
-        if self.num_classes == 2:
-            try:
-                from sklearn.metrics import roc_auc_score, average_precision_score
-                labels_np = all_labels.view(-1).detach().cpu().numpy()
-                probs_np = probs.detach().cpu().numpy()
-                
-                if len(np.unique(labels_np)) > 1:
-                    roc = roc_auc_score(labels_np, probs_np)
-                    ap = average_precision_score(labels_np, probs_np)
-                else:
-                    roc = 0.0
-                    ap = 0.0
-            except Exception as e:
-                print(f"Warning: Could not compute ROC/AP metrics: {e}")
-                roc = 0.0
-                ap = 0.0
-        else:
-            roc = 0.0
-            ap = 0.0
-        
-        metrics = {
-            'loss': combined_loss,
-            'classification_loss': avg_classification_loss,
-            'contrastive_loss': total_contrastive_loss,
-            'acc': acc.item(),
-            'roc': roc,
-            'ap': ap,
-            'num_graphs': len(data_list)
-        }
-        
-        return metrics
-    
-    def decode(self, x, batch=None):
-        return self.forward(x, batch)
-        
-    @property 
-    def sheaf_learners(self):
-        # 获取sheaf_learners
-        return getattr(self.graph_diffusion, 'sheaf_learners', [])
-    
-    @property
-    def epsilons(self):
-        # 获取epsilons
-        return getattr(self.graph_diffusion, 'epsilons', [])
-
-    def update_edge_index(self, edge_index):
-        # 更新边索引
-        self.graph_diffusion.update_edge_index(edge_index)
-        
-    def grouped_parameters(self):
-        # 返回分组的参数，用于优化器
-        return self.graph_diffusion.grouped_parameters()
-
-
-
-
-class EuclideanGraphDiffusion(SheafDiffusion):
-    """欧氏空间图扩散（消融：用欧氏 ODE 替换双曲 ODE）"""
-
-    def __init__(self, edge_index, args):
-        super(EuclideanGraphDiffusion, self).__init__(edge_index, args)
-        # 设定为常规 RK4（避免使用 hyperbolic_rk4）
-        if isinstance(args, dict):
-            args.setdefault('int_method', 'rk4')
-        else:
-            # argparse.Namespace 的情况
-            if not hasattr(args, 'int_method'):
-                setattr(args, 'int_method', 'rk4')
-
-        # 图/节点分类模式
-        self.graph_classification = args.get('graph_classification', True)
-
-        # 前端特征变换
-        self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
-        if self.second_linear:
-            self.lin12 = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        # 图分类头
-        if self.graph_classification:
-            self.pool_type = args.get('pool_type', 'mean')
-            if self.pool_type == 'attention':
-                self.attention_pool = nn.Sequential(
-                    nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-                    nn.ReLU(),
-                    nn.Linear(self.hidden_dim // 2, 1)
-                )
-            self.graph_classifier = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(self.hidden_dim // 2, self.output_dim)
+        ode_opt = self._build_ode_options(args)
+        for _ in range(max(1, self.layers)):
+            sheaf_learner = LocalConcatSheafLearner(
+                self.hidden_dim,
+                (self.final_d,),
+                self.sheaf_act,
+                edge_channels=self.sheaf_edge_channels,
+                edge_scale_bands=self.edge_scale_bands,
+                adaptive_edge_scale_gates=self.adaptive_edge_scale_gates,
+                adaptive_edge_scale_strength=self.adaptive_edge_scale_strength,
             )
-        else:
-            self.lin2 = nn.Linear(self.hidden_dim, self.output_dim)
-
-        # 与双曲版保持一致的 sheaf 与拉普拉斯构造（只是 ODE 换成欧氏）
-        self.sheaf_learner = LocalConcatSheafLearner(self.hidden_dim, (self.d,), sheaf_act=self.sheaf_act)
-        self.laplacian_builder = lb.DiagLaplacianBuilder(
-            self.graph_size, edge_index, d=self.d, add_hp=self.add_hp, add_lp=self.add_lp)
-
-        # 关键：使用欧氏 ODE
-        self.odefunc = LaplacianODEFunc(
-            self.final_d, self.sheaf_learner, self.laplacian_builder, edge_index,
-            self.graph_size, self.hidden_channels,
-            nonlinear=self.nonlinear, left_weights=self.left_weights,
-            right_weights=self.right_weights, use_act=self.use_act)
-        self.odeblock = ODEBlock(self.odefunc, self.time_range, args)
-
-        # 与双曲版一致的层归一化/激活（公平消融）
-        self.layer_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.layer_norm2 = nn.LayerNorm(self.hidden_dim)
-        self.residual = args.get('residual', True)
-        self.activation = nn.LeakyReLU(negative_slope=0.2)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.lin1.weight)
-        if self.graph_classification:
-            for layer in self.graph_classifier:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-        else:
-            nn.init.xavier_uniform_(self.lin2.weight)
-        if self.second_linear:
-            nn.init.xavier_uniform_(self.lin12.weight)
-
-    def graph_pooling(self, x, batch=None):
-        if self.pool_type == 'mean':
-            if batch is None:
-                return torch.mean(x, dim=0, keepdim=True)
-            else:
-                from torch_geometric.nn import global_mean_pool
-                return global_mean_pool(x, batch)
-        elif self.pool_type == 'max':
-            if batch is None:
-                return torch.max(x, dim=0, keepdim=True)[0]
-            else:
-                from torch_geometric.nn import global_max_pool
-                return global_max_pool(x, batch)
-        elif self.pool_type == 'sum':
-            if batch is None:
-                return torch.sum(x, dim=0, keepdim=True)
-            else:
-                from torch_geometric.nn import global_add_pool
-                return global_add_pool(x, batch)
-        elif self.pool_type == 'attention':
-            att = self.attention_pool(x)
-            att = F.softmax(att, dim=0)
-            if batch is None:
-                return torch.sum(x * att, dim=0, keepdim=True)
-            else:
-                graph_embed = []
-                for i in range(batch.max().item() + 1):
-                    mask = (batch == i)
-                    xg = x[mask]
-                    attg = F.softmax(att[mask], dim=0)
-                    graph_embed.append(torch.sum(xg * attg, dim=0))
-                return torch.stack(graph_embed)
-        else:
-            raise ValueError(f"Unknown pooling type: {self.pool_type}")
-
-    def forward(self, x, batch=None):
-        # 1) 前端特征
-        x = F.dropout(x, p=self.input_dropout, training=self.training)
-        x = self.lin1(x)
-        x = self.layer_norm1(x)
-        x = self.activation(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-
-        if self.second_linear:
-            x = self.lin12(x)
-            x = self.layer_norm2(x)
-            x = self.activation(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-
-        # 2) 欧氏 ODE 演化（无双曲映射）
-        if self.t > 0:
-            x = x.view(self.graph_size * self.final_d, -1)
-            x = self.odeblock(x)
-        x = x.view(self.graph_size, -1)
-
-        # 3) 输出
-        if self.graph_classification:
-            graph_embed = self.graph_pooling(x, batch)
-            output = self.graph_classifier(graph_embed)
-            if self.output_dim == 2:
-                return output[:, 0:1]
-            else:
-                return F.log_softmax(output, dim=1)
-        else:
-            x = self.lin2(x)
-            return F.log_softmax(x, dim=1)
-
-    def update_edge_index(self, edge_index):
-        super().update_edge_index(edge_index)
-        self.odefunc.update_laplacian_builder(self.laplacian_builder)
-
-
-class EuclideanGraphClassifier(nn.Module):
-    """欧氏空间图分类器（与 HyperbolicGraphClassifier 同接口，便于消融对比）"""
-    def __init__(self, edge_index, args):
-        super(EuclideanGraphClassifier, self).__init__()
-        self.args = args
-        self.task = 'graph_classification'
-
-        if isinstance(args, dict):
-            args_copy = args.copy()
-        else:
-            args_copy = vars(args).copy()
-        args_copy['graph_classification'] = True
-        args_copy['num_classes'] = args_copy.get('num_classes', 2)
-        args_copy.setdefault('int_method', 'rk4')
-
-        self.graph_diffusion = EuclideanGraphDiffusion(edge_index, args_copy)
-
-        self.num_classes = args_copy['num_classes']
-        self.criterion = nn.BCEWithLogitsLoss() if self.num_classes == 2 else nn.CrossEntropyLoss()
-
-        self.use_contrastive = args_copy.get('use_contrastive', True)
-        self.contrastive_weight = args_copy.get('contrastive_weight', 0.5)
-        self.temperature = args_copy.get('temperature', 0.1)
-        self.projection_dim = args_copy.get('projection_dim', 128)
-
-        if self.use_contrastive:
-            self.projection_head = nn.Sequential(
-                nn.Linear(self.graph_diffusion.hidden_dim, self.projection_dim),
-                nn.ReLU(),
-                nn.Linear(self.projection_dim, self.projection_dim)
+            laplacian_builder = lb.DiagLaplacianBuilder(
+                self.graph_size,
+                edge_index,
+                d=self.final_d,
+                normalised=self.normalised,
+                deg_normalised=self.deg_normalised,
+                add_hp=False,
+                add_lp=False,
             )
-
-    def forward(self, x, batch=None, return_embedding=False):
-        output = self.graph_diffusion(x, batch)
-        if return_embedding and self.use_contrastive:
-            x_processed = self.graph_diffusion.lin1(x)
-            if self.graph_diffusion.second_linear:
-                x_processed = self.graph_diffusion.lin12(x_processed)
-            graph_embed = self.graph_diffusion.graph_pooling(x_processed, batch)
-            projected = self.projection_head(graph_embed)
-            return output, projected
-        return output
-
-    def contrastive_loss(self, embeddings_list, labels_list):
-        if len(embeddings_list) < 2:
-            return torch.tensor(0.0, device=embeddings_list[0].device)
-        all_embeddings = torch.cat(embeddings_list, dim=0)
-        safe_labels = []
-        for lbl in labels_list:
-            if lbl.dim() == 0: lbl = lbl.unsqueeze(0)
-            else: lbl = lbl.view(-1)
-            safe_labels.append(lbl)
-        all_labels = torch.cat(safe_labels, dim=0)
-        all_embeddings = F.normalize(all_embeddings, p=2, dim=1)
-        sim = torch.mm(all_embeddings, all_embeddings.t()) / self.temperature
-        exp_sim = torch.exp(sim)
-        labels = all_labels.unsqueeze(1)
-        pos = (labels == labels.t()).float(); pos.fill_diagonal_(0)
-        neg = 1 - pos; neg.fill_diagonal_(0)
-        total, npos = 0, 0
-        for i in range(len(all_labels)):
-            pos_idx = torch.where(pos[i] > 0)[0]
-            if len(pos_idx) == 0: continue
-            neg_idx = torch.where(neg[i] > 0)[0]
-            pos_sum = exp_sim[i, pos_idx].sum()
-            neg_sum = exp_sim[i, neg_idx].sum()
-            if pos_sum > 0 and (pos_sum + neg_sum) > 0:
-                total = total - torch.log(pos_sum / (pos_sum + neg_sum))
-                npos += 1
-        return total / npos if npos > 0 else torch.tensor(0.0, device=all_embeddings.device)
-
-    def compute_metrics_multiple(self, embeddings_list, data_list, split):
-        if not isinstance(embeddings_list, list): embeddings_list = [embeddings_list]
-        if not isinstance(data_list, list): data_list = [data_list]
-        logits_list, labels_list, embeds_for_contrastive = [], [], []
-        total_loss = 0
-        for emb, data in zip(embeddings_list, data_list):
-            if self.use_contrastive:
-                logits, proj = self.forward(emb, return_embedding=True)
-                embeds_for_contrastive.append(proj)
+            if self.use_learned_hodge:
+                hodge_down_sheaf_learner = LocalConcatIncidenceSheafLearner(
+                    self.hidden_dim, (self.final_d,), self.sheaf_act)
+                hodge_up_sheaf_learner = LocalConcatIncidenceSheafLearner(
+                    self.hidden_dim, (self.final_d,), self.sheaf_act)
+                self.hodge_down_sheaf_learners.append(
+                    hodge_down_sheaf_learner)
+                self.hodge_up_sheaf_learners.append(
+                    hodge_up_sheaf_learner)
             else:
-                logits = self.forward(emb)
-            if 'graph_labels' in data: labels = data['graph_labels']
-            elif 'y' in data: labels = data['y']
-            elif 'labels' in data: labels = data['labels']
-            else: raise KeyError("No graph labels found in data")
-            labels = labels.view(-1).to(logits.device)
-            logits_list.append(logits); labels_list.append(labels)
-            if self.num_classes == 2:
-                loss = self.criterion(logits.view(-1), labels.float())
-            else:
-                loss = self.criterion(logits, labels.long())
-            total_loss += loss
-        if self.use_contrastive and len(embeds_for_contrastive) > 1:
-            cl = self.contrastive_loss(embeds_for_contrastive, labels_list)
-        else:
-            cl = torch.tensor(0.0, device=embeddings_list[0].device if len(embeddings_list)>0 else None)
-        avg_cls = total_loss / max(1, len(logits_list))
-        combined = avg_cls + self.contrastive_weight * cl if self.use_contrastive else avg_cls
-        all_logits = torch.cat(logits_list, dim=0)
-        all_labels = torch.cat(labels_list, dim=0)
-        if self.num_classes == 2:
-            probs = torch.sigmoid(all_logits.view(-1))
-            preds = (probs > 0.5).float()
-            labels_for_acc = all_labels.view(-1).float()
-        else:
-            probs = F.softmax(all_logits, dim=1)
-            preds = torch.argmax(all_logits, dim=1)
-            labels_for_acc = all_labels.view(-1).long()
-        acc = (preds == labels_for_acc).float().mean()
-        if self.num_classes == 2:
-            try:
-                from sklearn.metrics import roc_auc_score, average_precision_score
-                y = all_labels.view(-1).detach().cpu().numpy()
-                p = probs.detach().cpu().numpy()
-                roc = roc_auc_score(y, p) if len(np.unique(y)) > 1 else 0.0
-                ap = average_precision_score(y, p) if len(np.unique(y)) > 1 else 0.0
-            except Exception as e:
-                print(f"Warning: ROC/AP failed: {e}")
-                roc, ap = 0.0, 0.0
-        else:
-            roc, ap = 0.0, 0.0
+                hodge_down_sheaf_learner = None
+                hodge_up_sheaf_learner = None
+            odefunc = HyperbolicLaplacianODEFunc(
+                self.final_d,
+                sheaf_learner,
+                laplacian_builder,
+                edge_index,
+                self.graph_size,
+                self.hidden_channels,
+                hodge_down_sheaf_learner=hodge_down_sheaf_learner,
+                hodge_up_sheaf_learner=hodge_up_sheaf_learner,
+                left_weights=self.left_weights,
+                right_weights=self.right_weights,
+                use_act=args.get('use_ode_act', self.use_act),
+                max_nfe=args.get('max_nfe', 1000),
+                curvature=curvature,
+                learn_curvature=learn_curvature,
+                simplex_order=self.simplex_order,
+                use_learned_sheaf=self.use_learned_sheaf,
+                use_fixed_hodge=self.use_fixed_hodge,
+                hodge_weight=self.hodge_weight,
+                order2_edge_channels=self.sheaf_edge_channels,
+                order2_edge_state=args.get('order2_edge_state', True),
+                order2_edge_state_weight=args.get(
+                    'order2_edge_state_weight', 0.25),
+                order2_unsigned_up_projection=args.get(
+                    'order2_unsigned_up_projection', True),
+                learn_diffusion_time=args.get('learn_diffusion_time', False),
+                diffusion_time=args.get('max_t', 0.1),
+                diffusion_time_min=args.get('diffusion_time_min', 0.01),
+                diffusion_time_max=args.get('diffusion_time_max', 0.5),
+            )
+            self.sheaf_learners.append(sheaf_learner)
+            self.laplacian_builders.append(laplacian_builder)
+            self.odefuncs.append(odefunc)
+            self.odeblocks.append(ODEBlock(odefunc, self.time_range, ode_opt))
+
+        self.sheaf_learner = self.sheaf_learners[0]
+        self.laplacian_builder = self.laplacian_builders[0]
+        self.odefunc = self.odefuncs[0]
+        self.odeblock = self.odeblocks[0]
+
+    def _build_ode_options(self, args):
         return {
-            'loss': combined,
-            'classification_loss': avg_cls,
-            'contrastive_loss': cl,
-            'acc': acc.item(),
-            'roc': roc,
-            'ap': ap,
-            'num_graphs': len(data_list)
+            'int_method': args.get('int_method', 'hyperbolic_rk4'),
+            'step_size': args.get('step_size', 0.5),
+            'max_iters': args.get('max_nfe', 1000),
+            'adjoint': args.get('adjoint', False),
+            'adjoint_method': args.get('adjoint_method', 'rk4'),
+            'adjoint_step_size': args.get('adjoint_step_size', 1.0),
+            'tol_scale': args.get('tol_scale', 1.0),
+            'tol_scale_adjoint': args.get('tol_scale_adjoint', 1.0),
         }
 
-    def decode(self, x, batch=None):
-        return self.forward(x, batch)
+    def get_curvature(self):
+        return F.softplus(self.c_param)
 
-    def update_edge_index(self, edge_index):
-        self.graph_diffusion.update_edge_index(edge_index)
+    def get_diffusion_times(self):
+        """Expose per-layer effective times for training diagnostics."""
+        return [odefunc.get_diffusion_times() for odefunc in self.odefuncs]
 
-    def grouped_parameters(self):
-        return self.graph_diffusion.grouped_parameters()
+    def get_diffusion_residual_weight(self):
+        """Return the learned contribution of the post-diffusion state."""
+        if not self.diffusion_residual:
+            return None
+        return torch.sigmoid(self.diffusion_residual_logit)
+
+    def get_edge_scale_gates(self):
+        """Return the most recent mean ACX scale multipliers per layer."""
+        return [
+            learner.last_edge_scale_gates
+            for learner in self.sheaf_learners
+            if learner.last_edge_scale_gates is not None
+        ]
+
+    def set_adaptive_edge_scale_strength(self, strength):
+        """Set the bounded per-edge scale residual used by every diffusion layer."""
+        for learner in self.sheaf_learners:
+            learner.adaptive_edge_scale_strength = strength
+
+    def get_adaptive_edge_scale_strength(self):
+        if not self.adaptive_edge_scale_gates or not self.sheaf_learners:
+            return None
+        return self.sheaf_learners[0].adaptive_edge_scale_strength
+
+    def get_multiscale_node_fusion(self):
+        if not self.multiscale_node_fusion:
+            return None
+        return {
+            'alpha': torch.sigmoid(self.multiscale_node_fusion_logit),
+            'weights': torch.softmax(self.multiscale_node_scale_logits, dim=0),
+        }
+
+    def get_roi_pool_weights(self):
+        if self.roi_pool_logits is None:
+            return None
+        return torch.softmax(self.roi_pool_logits, dim=-1)
+
+    def get_roi_pool_residual(self):
+        if self.roi_pool_residual_logit is None:
+            return None
+        return torch.sigmoid(self.roi_pool_residual_logit)
+
+    def get_roi_logit_fusion(self):
+        if self.roi_logit_fusion_logit is None:
+            return None
+        return torch.sigmoid(self.roi_logit_fusion_logit)
+
+    def get_signed_roi_weights(self):
+        if self.roi_signed_logits is None:
+            return None
+        weights = torch.tanh(self.roi_signed_logits)
+        return weights / weights.abs().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    @property
+    def c(self):
+        return self.get_curvature()
+
+    def forward(self, data):
+        for odefunc in self.odefuncs:
+            odefunc.nfe = 0
+
+        batch_size = int(data.batch.max().item() + 1) if hasattr(data, 'batch') else 1
+        x = data.x
+        if self.multiscale_node_fusion:
+            feature_blocks = x.view(
+                x.size(0), self.multiscale_node_bands + 1, self.graph_size)
+            aggregate = feature_blocks[:, 0]
+            scale_weights = torch.softmax(
+                self.multiscale_node_scale_logits, dim=0)
+            scale_specific = torch.sum(
+                feature_blocks[:, 1:] * scale_weights.view(1, -1, 1), dim=1)
+            fusion_alpha = torch.sigmoid(self.multiscale_node_fusion_logit)
+            x = (1.0 - fusion_alpha) * aggregate + fusion_alpha * scale_specific
+        x = self.lin1(x)
+        if self.use_act:
+            x = F.elu(x)
+        x = F.dropout(x, p=self.input_dropout, training=self.training)
+        if self.second_linear:
+            x = self.lin12(x)
+
+        x = self.manifold.proj(
+            self.manifold.expmap0(self.manifold.proj_tan0(x, self.c), c=self.c),
+            c=self.c,
+        )
+        x = x.view(batch_size, self.graph_size, -1)
+        x_initial = x
+
+        if self.t > 0:
+            x = self._run_ode_layers(data, x, batch_size)
+
+        x = self.manifold.logmap0(x.view(-1, x.size(-1)), self.c)
+        x = x.view(batch_size, self.graph_size, -1)
+        if self.diffusion_residual:
+            x_initial = self.manifold.logmap0(
+                x_initial.view(-1, x_initial.size(-1)), self.c)
+            x_initial = x_initial.view(batch_size, self.graph_size, -1)
+            diffusion_weight = torch.sigmoid(self.diffusion_residual_logit)
+            x = (1.0 - diffusion_weight) * x_initial + diffusion_weight * x
+        if self.pool_type == 'dual_roi_attention':
+            global_logits = self.classifier(x.mean(dim=1))
+            weights = torch.softmax(self.roi_pool_logits, dim=-1)
+            roi_features = torch.einsum('hn,bnd->bhd', weights, x)
+            roi_logits = self.roi_classifier(
+                roi_features.flatten(start_dim=1))
+            fusion_weight = torch.sigmoid(self.roi_logit_fusion_logit)
+            logits = global_logits + fusion_weight * roi_logits
+            return F.log_softmax(logits, dim=1)
+        x = self._pool_graph(x)
+        logits = self.classifier(x)
+        return F.log_softmax(logits, dim=1)
+
+    def _run_ode_layers(self, data, x, batch_size):
+        if self.odefunc.simplex_order != 2:
+            return self._run_batched_order1_ode(data, x, batch_size)
+
+        x_out = []
+        for sample_idx in range(batch_size):
+            edge_index, edge_attr, sheaf_edge_attr = self._get_sample_edges(
+                data, sample_idx, x.device)
+            B1, B2 = self._get_boundary_matrices(data, sample_idx, x.device)
+            incidence_context = self._get_incidence_context(
+                data, sample_idx, x.device, B1, B2)
+            x_single = x[sample_idx].view(self.graph_size * self.final_d, -1)
+
+            for layer_idx, (odefunc, odeblock) in enumerate(zip(self.odefuncs, self.odeblocks)):
+                cache_key = self._laplacian_cache_key(data, sample_idx, layer_idx, edge_index)
+                laplacian_builder = self._get_laplacian_builder(cache_key, self.graph_size, edge_index)
+                hodge_down_builder = None
+                hodge_up_builder = None
+                if self.use_learned_hodge:
+                    edge_node_index, edge_node_sign, face_edge_index, face_edge_sign = (
+                        incidence_context)
+                    hodge_down_builder = self._get_hodge_laplacian_builder(
+                        self._hodge_laplacian_cache_key(
+                            cache_key, 'hodge_down',
+                            edge_node_index, edge_node_sign),
+                        B1.size(1),
+                        edge_node_index,
+                        edge_node_sign,
+                        edge_dim=0,
+                    )
+                    hodge_up_builder = self._get_hodge_laplacian_builder(
+                        self._hodge_laplacian_cache_key(
+                            cache_key, 'hodge_up',
+                            face_edge_index, face_edge_sign),
+                        B1.size(1),
+                        face_edge_index,
+                        face_edge_sign,
+                        edge_dim=1,
+                    )
+                self.laplacian_builders[layer_idx] = laplacian_builder
+                self.sheaf_learners[layer_idx].edge_index = edge_index
+                odefunc.set_graph_context(
+                    edge_index=edge_index,
+                    edge_attr=edge_attr,
+                    sheaf_edge_attr=sheaf_edge_attr,
+                    B1=B1,
+                    B2=B2,
+                    edge_node_index=incidence_context[0],
+                    edge_node_sign=incidence_context[1],
+                    face_edge_index=incidence_context[2],
+                    face_edge_sign=incidence_context[3],
+                    laplacian_builder=laplacian_builder,
+                    hodge_down_laplacian_builder=hodge_down_builder,
+                    hodge_up_laplacian_builder=hodge_up_builder,
+                )
+                x_single = odeblock(x_single)
+
+            x_out.append(x_single.view(self.graph_size, -1))
+        return torch.stack(x_out, dim=0)
+
+    def _get_laplacian_builder(self, cache_key, graph_size, edge_index):
+        builder = self.laplacian_builder_cache.get(cache_key)
+        if builder is None:
+            builder = lb.DiagLaplacianBuilder(
+                graph_size,
+                edge_index,
+                d=self.final_d,
+                normalised=self.normalised,
+                deg_normalised=self.deg_normalised,
+                add_hp=False,
+                add_lp=False,
+            )
+            self.laplacian_builder_cache[cache_key] = builder
+        return builder
+
+    def _get_hodge_laplacian_builder(
+            self, cache_key, edge_size, incidence_index, incidence_sign,
+            edge_dim):
+        builder = self.hodge_laplacian_builder_cache.get(cache_key)
+        if builder is None:
+            builder = lb.DiagHodgeLaplacianBuilder(
+                edge_size,
+                incidence_index,
+                incidence_sign,
+                d=self.final_d,
+                edge_dim=edge_dim,
+                normalised=self.normalised,
+                deg_normalised=self.deg_normalised,
+            )
+            self.hodge_laplacian_builder_cache[cache_key] = builder
+        return builder
+
+    @staticmethod
+    def _hodge_laplacian_cache_key(
+            base_key, kind, incidence_index, incidence_sign):
+        if base_key and base_key[0] == 'sample':
+            return base_key + (kind,)
+        index_bytes = incidence_index.detach().cpu().contiguous().numpy().tobytes()
+        sign_bytes = incidence_sign.detach().cpu().contiguous().numpy().tobytes()
+        return base_key + (kind, index_bytes, sign_bytes)
+
+    def _laplacian_cache_key(self, data, sample_idx, layer_idx, edge_index):
+        if hasattr(data, 'graph_idx'):
+            graph_idx = int(data.graph_idx[sample_idx].item())
+            return ('sample', graph_idx, layer_idx, str(edge_index.device))
+        edge_bytes = edge_index.detach().cpu().contiguous().numpy().tobytes()
+        return ('edge_index', edge_bytes, layer_idx, str(edge_index.device))
+
+    def _run_batched_order1_ode(self, data, x, batch_size):
+        device = x.device
+        total_nodes = batch_size * self.graph_size
+        edge_index = data.edge_index.to(device)
+        edge_attr = data.edge_attr.to(device) if hasattr(data, 'edge_attr') and data.edge_attr is not None else None
+        sheaf_edge_attr = None
+        if self.use_edge_features and hasattr(data, 'sheaf_edge_attr') and data.sheaf_edge_attr is not None:
+            sheaf_edge_attr = data.sheaf_edge_attr.to(device)
+        x_batch = x.reshape(total_nodes * self.final_d, -1)
+
+        laplacian_builder = None
+        if self.use_learned_sheaf:
+            laplacian_builder = lb.DiagLaplacianBuilder(
+                total_nodes,
+                edge_index,
+                d=self.final_d,
+                normalised=self.normalised,
+                deg_normalised=self.deg_normalised,
+                add_hp=False,
+                add_lp=False,
+            )
+
+        for layer_idx, (odefunc, odeblock) in enumerate(zip(self.odefuncs, self.odeblocks)):
+            if laplacian_builder is not None:
+                self.laplacian_builders[layer_idx] = laplacian_builder
+            self.sheaf_learners[layer_idx].edge_index = edge_index
+            odefunc.set_graph_context(
+                edge_index=edge_index,
+                edge_attr=edge_attr,
+                sheaf_edge_attr=sheaf_edge_attr,
+                B1=None,
+                B2=None,
+                edge_node_index=None,
+                edge_node_sign=None,
+                face_edge_index=None,
+                face_edge_sign=None,
+                laplacian_builder=laplacian_builder,
+                hodge_down_laplacian_builder=None,
+                hodge_up_laplacian_builder=None,
+                graph_size=total_nodes,
+            )
+            x_batch = odeblock(x_batch)
+
+        return x_batch.view(batch_size, self.graph_size, -1)
+
+    def _get_sample_edges(self, data, sample_idx, device):
+        if not hasattr(data, 'batch') or not hasattr(data, 'ptr'):
+            edge_attr = data.edge_attr.to(device) if hasattr(data, 'edge_attr') and data.edge_attr is not None else None
+            sheaf_edge_attr = None
+            if self.use_edge_features and hasattr(data, 'sheaf_edge_attr') and data.sheaf_edge_attr is not None:
+                sheaf_edge_attr = data.sheaf_edge_attr.to(device)
+            return data.edge_index.to(device), edge_attr, sheaf_edge_attr
+
+        start = int(data.ptr[sample_idx].item())
+        end = int(data.ptr[sample_idx + 1].item())
+        edge_index = data.edge_index
+        mask = (edge_index[0] >= start) & (edge_index[0] < end)
+        sample_edge_index = (edge_index[:, mask] - start).to(device)
+        sample_edge_attr = None
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            sample_edge_attr = data.edge_attr[mask].to(device)
+        sample_sheaf_edge_attr = None
+        if self.use_edge_features and hasattr(data, 'sheaf_edge_attr') and data.sheaf_edge_attr is not None:
+            sample_sheaf_edge_attr = data.sheaf_edge_attr[mask].to(device)
+        return sample_edge_index, sample_edge_attr, sample_sheaf_edge_attr
+
+    def _get_boundary_matrices(self, data, sample_idx, device):
+        if self.odefunc.simplex_order != 2:
+            return None, None
+
+        if hasattr(data, 'sigma1_list') and hasattr(data, 'sigma2_list'):
+            B1 = data.sigma1_list[sample_idx]
+            B2 = data.sigma2_list[sample_idx]
+        elif hasattr(data, 'sigma1') and hasattr(data, 'sigma2'):
+            B1 = data.sigma1
+            B2 = data.sigma2
+        B1 = B1.to(device)
+        B2 = B2.to(device)
+        if B1.size(0) != self.graph_size:
+            B1 = B1[:self.graph_size, :]
+        if B2.size(0) != B1.size(1):
+            B2 = B2[:B1.size(1), :]
+        return B1, B2
+
+    def _get_incidence_context(self, data, sample_idx, device, B1, B2):
+        if self.odefunc.simplex_order != 2:
+            return None, None, None, None
+
+        list_attributes = (
+            'edge_node_index_list',
+            'edge_node_sign_list',
+            'face_edge_index_list',
+            'face_edge_sign_list',
+        )
+        single_attributes = (
+            'edge_node_index',
+            'edge_node_sign',
+            'face_edge_index',
+            'face_edge_sign',
+        )
+        if all(hasattr(data, name) for name in list_attributes):
+            values = tuple(
+                getattr(data, name)[sample_idx] for name in list_attributes)
+        elif all(hasattr(data, name) for name in single_attributes):
+            values = tuple(getattr(data, name) for name in single_attributes)
+        else:
+            edge_node_index, edge_node_sign = boundary_to_incidence_data(B1)
+            face_edge_index, face_edge_sign = boundary_to_incidence_data(B2)
+            values = (
+                edge_node_index,
+                edge_node_sign,
+                face_edge_index,
+                face_edge_sign,
+            )
+
+        return tuple(value.to(device) for value in values)
+
+    def _pool_graph(self, x):
+        if self.pool_type == 'mean':
+            return x.mean(dim=1)
+        if self.pool_type == 'max':
+            return x.max(dim=1)[0]
+        if self.pool_type == 'sum':
+            return x.sum(dim=1)
+        if self.pool_type == 'attention':
+            attn_weights = torch.softmax(x.mean(dim=-1), dim=-1)
+            return (x * attn_weights.unsqueeze(-1)).sum(dim=1)
+        if self.pool_type == 'mean_std':
+            return torch.cat([
+                x.mean(dim=1),
+                x.std(dim=1, unbiased=False),
+            ], dim=-1)
+        if self.pool_type == 'mean_max':
+            return torch.cat([
+                x.mean(dim=1),
+                x.max(dim=1).values,
+            ], dim=-1)
+        if self.pool_type == 'signed_roi_attention':
+            weights = self.get_signed_roi_weights()
+            pooled = torch.einsum('hn,bnd->bhd', weights, x)
+            return pooled.flatten(start_dim=1)
+        if self.pool_type in (
+                'roi_attention', 'mean_roi_attention', 'residual_roi_attention'):
+            weights = torch.softmax(self.roi_pool_logits, dim=-1)
+            pooled = torch.einsum('hn,bnd->bhd', weights, x)
+            if self.pool_type == 'residual_roi_attention':
+                roi_summary = pooled.mean(dim=1)
+                global_mean = x.mean(dim=1)
+                residual_weight = torch.sigmoid(
+                    self.roi_pool_residual_logit)
+                return global_mean + residual_weight * (
+                    roi_summary - global_mean)
+            pooled = pooled.flatten(start_dim=1)
+            if self.pool_type == 'mean_roi_attention':
+                return torch.cat([x.mean(dim=1), pooled], dim=-1)
+            return pooled
+        return x.mean(dim=1)

@@ -11,8 +11,6 @@ from torch.autograd.functional import vjp
 # Precompute divisions
 _one_third = 1 / 3
 _two_thirds = 2 / 3
-_one_sixth = 1 / 6 
-_one_eighth = 1 / 8
 
 
 class Perturb(Enum):
@@ -77,6 +75,7 @@ def _nextafter(x1, x2):
             out = np_nextafter(x1, x2)
     return _StitchGradient.apply(x1, out)
 
+
 def np_nextafter(x1, x2):
     warnings.warn("torch.nextafter is only available in PyTorch 1.7 or newer."
                   "Falling back to numpy.nextafter. Upgrade PyTorch to remove this warning.")
@@ -84,6 +83,7 @@ def np_nextafter(x1, x2):
     x2_np = x2.detach().cpu().numpy()
     out = torch.tensor(np.nextafter(x1_np, x2_np)).to(x1)
     return out
+
 
 def _interp_evaluate(coefficients, t0, t1, t):
     """Evaluate polynomial interpolation at the given time point.
@@ -162,8 +162,6 @@ class _PerturbFunc(torch.nn.Module):
             # Do nothing.
             pass
         return self.base_func(t, y)
-
-
 
 
 def _rms_norm(tensor):
@@ -380,7 +378,7 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
         dt: Time step (scalar tensor).
         t1: Next time (scalar tensor).
         y0: Current state (point on the manifold, tensor).
-        manifold: Object with expmap(p, v) and logmap(p, q) methods.
+        manifold: Object with expmap(v, p) and logmap(p, q) methods.
         perturb: Whether to perturb time evaluations (Perturb enum).
     
     Returns:
@@ -422,56 +420,51 @@ def hyperbolic_rk4_step_func(func, t0, dt, t1, y0, manifold, perturb=False,c=1.0
     
 
     # 重新定义了 k_i , 论文中的 k_i 是在不同时空点评估的向量流 F (都是双曲空间中的点)
-    # k1: 对应论文公式 (14)
+    # k1
     k1_raw = func(t0, y0, perturb=Perturb.NEXT if perturb else Perturb.NONE)
     k1 = manifold.proj(k1_raw, c=c)  # 确保在流形上
     
-    # k2: 对应论文公式 (13), 第一部分
-    # 首先计算中间点 y_mid_2
+    # k2
     v_k1 = manifold.logmap(y0, k1, c=c)
-    # x_k2 = v_k1 / 3.0           # 对于之前的步长缩放的一些调整,比原来少了一次
-    # y_mid_2 = manifold.expmap(y0, (dt / 3.0) * v_k1, c=c) # 原论文公式为 exp(tau * x_k2)
-    # k2 = func(t0 + dt / 3.0, manifold.proj(y_mid_2, c=c))
+    v_k1 = torch.clamp(v_k1, min=-5.0, max=5.0)  # 添加裁剪
     x_k2 = v_k1 / 3.0
-    y_mid_2 = manifold.expmap(y0, (dt / 3.0) * x_k2, c=c)
+    y_mid_2 = manifold.expmap((dt / 3.0) * x_k2, y0, c=c)
     y_mid_2 = manifold.proj(y_mid_2, c=c)  # 投影确保在流形上
     k2_raw = func(t0 + dt / 3.0, y_mid_2)
     k2 = manifold.proj(k2_raw, c=c)
 
-    # k3: 对应论文公式 (13), 第二部分
+    # k3
     v_k2 = manifold.logmap(y0, k2, c=c)
+    v_k2 = torch.clamp(v_k2, min=-5.0, max=5.0)  # 添加裁剪
     x_k3 = v_k2 - v_k1 / 3.0
-    y_mid_3 = manifold.expmap(y0, dt * x_k3, c=c)
-    # k3 = func(t0 + 2.0 * dt / 3.0, manifold.proj(y_mid_3, c=c))
+    y_mid_3 = manifold.expmap(dt * x_k3, y0, c=c)
     y_mid_3 = manifold.proj(y_mid_3, c=c)  # 投影确保在流形上
     k3_raw = func(t0 + 2.0 * dt / 3.0, y_mid_3)
     k3 = manifold.proj(k3_raw, c=c)
 
-    # k4: 对应论文公式 (13), 第三部分
+    # k4
     v_k3 = manifold.logmap(y0, k3, c=c)
+    v_k3 = torch.clamp(v_k3, min=-5.0, max=5.0)  # 添加裁剪
     x_k4 = v_k1 - v_k2 + v_k3
-    y_mid_4 = manifold.expmap(y0, dt * x_k4, c=c)
-    # k4 = func(t1, manifold.proj(y_mid_4, c=c), perturb=Perturb.PREV if perturb else Perturb.NONE)
+    y_mid_4 = manifold.expmap(dt * x_k4, y0, c=c)
     y_mid_4 = manifold.proj(y_mid_4, c=c)  # 投影确保在流形上
     k4_raw = func(t1, y_mid_4, perturb=Perturb.PREV if perturb else Perturb.NONE)
     k4 = manifold.proj(k4_raw, c=c)
     
-    # 将所有流 k_i 拉回 y0 的切空间，加权平均，然后更新   
-    # 对应论文公式 (9) 
+    # 将所有流 k_i 拉回 y0 的切空间
     v_k4 = manifold.logmap(y0, k4, c=c)
+    v_k4 = torch.clamp(v_k4, min=-5.0, max=5.0)  # 添加裁剪
     
-    # 使用 3/8 规则的权重 {1, 3, 3, 1} 进行加权平均 [cite: 139]
+    # 使用 3/8 规则的权重
     final_tangent_vector = (v_k1 + 3.0 * v_k2 + 3.0 * v_k3 + v_k4) / 8.0
     
-    # 限制切向量的范数防止爆炸 cite ?
-    final_tangent_vector = torch.clamp(final_tangent_vector, min=-5.0, max=5.0)
+    final_tangent_vector = torch.clamp(final_tangent_vector, min=-3.0, max=3.0)
     
-    # 从 y0 点沿最终方向移动 dt 距离，得到 y1
-    # 对应论文公式 (8) [cite: 133]
-    y1 = manifold.expmap(y0, dt * final_tangent_vector, c=c)
+    # 从 y0 点沿最终方向移动
+    y1 = manifold.expmap(dt * final_tangent_vector, y0, c=c)
     
-    return manifold.proj(y1, c=c)  # 最终投影确保在流形上
-    
+    return manifold.proj(y1, c=c)
+
 
 def rk4_alt_step_func(func, t0, dt, t1, y0, f0=None, perturb=False):
     """Smaller error with slightly more compute."""
@@ -624,7 +617,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         if t == t1:
             return y1
         h_tan = (t1 - t) * self.manifold.logmap(y0, y1) / (t1 - t0)
-        return self.proj(self.manifold.expmap(y0, h_tan, c), c)
+        return self.manifold.proj(self.manifold.expmap(h_tan, y0, c=1.0), c=1.0)
 
 class RK4(FixedGridODESolver):
     order = 4
@@ -650,9 +643,9 @@ class HyperbolicRK4(FixedGridODESolver):
             perturb: Whether to perturb time evaluations.
             manifold: Manifold object with expmap and logmap methods.
         """
-        # 处理 unused_kwargs 中的 manifold 参数
         if manifold is None and 'manifold' in unused_kwargs:
             manifold = unused_kwargs.pop('manifold')
+        unused_kwargs.pop('max_iters', None)
             
         super().__init__(func, y0, step_size=step_size, grid_constructor=grid_constructor, interp=interp, perturb=perturb, manifold=manifold, **unused_kwargs)
         self.manifold = manifold
@@ -694,6 +687,40 @@ class HyperbolicRK4(FixedGridODESolver):
         return dy, f0
 
 
+class HyperbolicEuler(FixedGridODESolver):
+    """First-order hyperbolic Euler solver for faster exploratory runs."""
+
+    order = 1
+
+    def __init__(self, func, y0, step_size=None, grid_constructor=None, interp="hyperbolic",
+                 perturb=False, manifold=None, **unused_kwargs):
+        if manifold is None and 'manifold' in unused_kwargs:
+            manifold = unused_kwargs.pop('manifold')
+        unused_kwargs.pop('max_iters', None)
+        super().__init__(
+            func,
+            y0,
+            step_size=step_size,
+            grid_constructor=grid_constructor,
+            interp=interp,
+            perturb=perturb,
+            manifold=manifold,
+            **unused_kwargs,
+        )
+        self.manifold = manifold
+        if manifold is None:
+            raise ValueError("Manifold object must be provided for hyperbolic integration.")
+
+    def _step_func(self, func, t0, dt, t1, y0):
+        y_flow = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
+        y_flow = self.manifold.proj(y_flow, c=1.0)
+        tangent = self.manifold.logmap(y0, y_flow, c=1.0)
+        tangent = torch.clamp(tangent, min=-5.0, max=5.0)
+        y1 = self.manifold.expmap(dt * tangent, y0, c=1.0)
+        y1 = self.manifold.proj(y1, c=1.0)
+        return y1 - y0, tangent
+
+
 
 # class Dopri5Solver():
     # print("Dopri5Solver is not implemented yet. Please use RK4 or another solver.")
@@ -701,6 +728,7 @@ class HyperbolicRK4(FixedGridODESolver):
 SOLVERS = {
     'rk4': RK4,
     'hyperbolic_rk4': HyperbolicRK4,
+    'euler': HyperbolicEuler,
 }
 
 
@@ -1003,15 +1031,13 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     for param, vjp_param in zip(adjoint_params, vjp_params)
                 ]
 
-            # 确保梯度不为None
-            vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
-            vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
-            vjp_params = [
-                torch.zeros_like(param) if vjp_param is None else vjp_param
-                for param, vjp_param in zip(adjoint_params, vjp_params)
-            ]
+                # autograd.grad returns None if no gradient, set to zero.
+                vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
+                vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
+                vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
+                              for param, vjp_param in zip(adjoint_params, vjp_params)]
 
-            return (vjp_t, func_eval, vjp_y, *vjp_params)
+                return (vjp_t, func_eval, vjp_y, *vjp_params)
 
             # Add adjoint callbacks
             for callback_name, adjoint_callback_name in zip(_all_callback_names, _all_adjoint_callback_names):
@@ -1156,45 +1182,6 @@ def handle_adjoint_norm_(adjoint_options, shapes, state_norm):
     def default_adjoint_norm(tensor_tuple):
         t, y, adj_y, *adj_params = tensor_tuple
         # (If the state is actually a flattened tuple then this will be unpacked again in state_norm.)
-        return max(t.abs(), state_norm(y), state_norm(adj_y), _mixed_norm(adj_params))
-
-    if "norm" not in adjoint_options:
-        # `adjoint_options` was not explicitly specified by the user. Use the default norm.
-        adjoint_options["norm"] = default_adjoint_norm
-    else:
-        # `adjoint_options` was explicitly specified by the user...
-        try:
-            adjoint_norm = adjoint_options['norm']
-        except KeyError:
-            # ...but they did not specify the norm argument. Back to plan A: use the default norm.
-            adjoint_options['norm'] = default_adjoint_norm
-        else:
-            # ...and they did specify the norm argument.
-            if adjoint_norm == 'seminorm':
-                # They told us they want to use seminorms. Slight modification to plan A: use the default norm,
-                # but ignore the parameter state
-                def adjoint_seminorm(tensor_tuple):
-                    t, y, adj_y, *adj_params = tensor_tuple
-                    # (If the state is actually a flattened tuple then this will be unpacked again in state_norm.)
-                    return max(t.abs(), state_norm(y), state_norm(adj_y))
-                adjoint_options['norm'] = adjoint_seminorm
-            else:
-                # And they're using their own custom norm.
-                if shapes is None:
-                    # The state on the forward pass was a tensor, not a tuple. We don't need to do anything, they're
-                    # already going to get given the full adjoint state as (t, y, adj_y, adj_params)
-                    pass  # this branch included for clarity
-                else:
-                    # This is the bit that is tuple/tensor abstraction-breaking, because the odeint machinery
-                    # doesn't know about the tupled nature of the forward state. We need to tell the user's adjoint
-                    # norm about that ourselves.
-
-                    def _adjoint_norm(tensor_tuple):
-                        t, y, adj_y, *adj_params = tensor_tuple
-                        y = _flat_to_shape(y, (), shapes)
-                        adj_y = _flat_to_shape(adj_y, (), shapes)
-                        return adjoint_norm((t, *y, *adj_y, *adj_params))
-                    adjoint_options['norm'] = _adjoint_norm
         return max(t.abs(), state_norm(y), state_norm(adj_y), _mixed_norm(adj_params))
 
     if "norm" not in adjoint_options:

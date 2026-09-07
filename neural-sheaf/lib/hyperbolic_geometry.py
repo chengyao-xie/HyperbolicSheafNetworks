@@ -6,6 +6,7 @@ import numpy as np
 
 def identity(x):
     return x
+
 def cosh(x, clamp=15):
     return x.clamp(-clamp, clamp).cosh()
 
@@ -179,23 +180,12 @@ class PoincareBall(Manifold):
         self.eps = {torch.float32: 4e-3, torch.float64: 1e-5}
 
     def sqdist(self, p1, p2, c):
-        ### BATCH
-
-        ## here would be a good spot to normalize?-- no it wouldn't leave this shit alone.
-        # print(p1,'p1?')
-        # print(p2,'p1?')
-        # print(c,'c?')
-        # p1=torch.from_numpy(np.array(p1).astype(float))
-        # p2=torch.from_numpy(np.array(p2).astype(float))
         sqrt_c = c ** 0.5
         dist_c = artanh(
             sqrt_c * self.mobius_add(-p1, p2, c, dim=-1).norm(dim=-1, p=2, keepdim=False)
         )
 
-        # print(dist_c,'DIST C')
-        # print(sqrt_c,'sqrizzle')
         dist = dist_c * 2 / sqrt_c
-        # print(dist)
         return dist ** 2
 
     def _lambda_x(self, x, c):
@@ -208,10 +198,8 @@ class PoincareBall(Manifold):
         return dp
 
     def proj(self, x, c):
-        ##BATCH
         norm = torch.clamp_min(x.norm(dim=-1, keepdim=True, p=2), self.min_norm)
         maxnorm = (1 - self.eps[x.dtype]) / (c ** 0.5)
-        # print(maxnorm,'MAX NORM',c)
         cond = norm > maxnorm
         projected = x / norm * maxnorm
         
@@ -298,7 +286,6 @@ class PoincareBall(Manifold):
         a = -c2 * uw * v2 + c * vw + 2 * c2 * uv * vw
         b = -c2 * vw * u2 - c * uw
         d = 1 + 2 * c * uv + c2 * u2 * v2
-        print(d)
         return w + 2 * (a * u + b * v) / d.clamp_min(self.min_norm)
 
     def inner(self, x, c, u, v=None, keepdim=False):
